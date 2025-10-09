@@ -1,6 +1,6 @@
-Jack Radcliffe E25A001#1 E25A016#2
-John Smith
-Joe Bloggs
+Jack Radcliffe jack.f.radcliffe@gmail.com E25A001#1 E25A016#2
+John Smith jack.radcliffe@manchester.ac.uk
+Joe Bloggs jack.radcliffe@up.ac.za
 Sarah Marais
 Lucy Liu
 Peter Pan

@@ -6,7 +6,7 @@ Utility scripts to help the EVN Programme Committee chair prepare reviewer templ
 - Python 3.9 or newer.
 - Poppler's `pdftotext` binary available on `PATH` (used by `proposal_to_review_template.py`).
 - Proposal PDFs exported from the EVN submission system.
-- Optional: a current list of PC members in `EVN_pc_members.txt` (one name per line).
+- Optional: a current list of PC members in `EVN_pc_members.txt` (`Name Email` per line, plus optional `E25A001#1` fixed preferences).
 
 ## Typical workflow
 1. **Generate review templates**
@@ -23,5 +23,5 @@ Utility scripts to help the EVN Programme Committee chair prepare reviewer templ
 
 ## Additional Notes
 - `template.py` contains the low-level renderer used by `proposal_to_review_template.py`; it can also be used directly by piping ampersand-delimited records from legacy sources.
-- Sample member data is provided in `EVN_pc_members.txt`. Update it each cycle so the automatic assignment logic remains accurate.
+- Sample member data is provided in `EVN_pc_members.txt`, including example email addresses. Update it each cycle so the automatic assignment logic remains accurate.
 - Run any script with `-h`/`--help` to view the full set of options and usage examples.

@@ -369,8 +369,8 @@ def parse_summary(lines: Sequence[str]) -> tuple[List[str], List[str]]:
     return networks, wavebands
 
 
-def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]]]:
-    """Read PC member entries and return names plus fixed reviewer preferences."""
+def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]], Dict[str, str]]:
+    """Read PC member entries and return names, fixed reviewer preferences, and email mapping."""
     try:
         content = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -378,6 +378,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
 
     members: List[str] = []
     fixed: Dict[str, Dict[str, List[str]]] = {}
+    emails: Dict[str, str] = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -386,6 +387,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
         name_tokens: List[str] = []
         first_fixed: List[str] = []
         second_fixed: List[str] = []
+        email: Optional[str] = None
         for token in tokens:
             if "#" in token:
                 try:
@@ -399,6 +401,10 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
                     first_fixed.append(proposal_code)
                 elif slot == "2":
                     second_fixed.append(proposal_code)
+            elif email is None and "@" in token:
+                cleaned_email = token.strip("<>[](){};,")
+                if cleaned_email:
+                    email = cleaned_email
             else:
                 name_tokens.append(token)
         name = " ".join(name_tokens).strip()
@@ -410,10 +416,12 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
                 "first": first_fixed,
                 "second": second_fixed,
             }
+        if email:
+            emails[name] = email
 
     if not members:
         raise ValueError(f"No PC members found in {path}")
-    return members, fixed
+    return members, fixed, emails
 
 
 def assign_reviewers(
@@ -710,7 +718,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "-m",
         "--pc-members",
         type=Path,
-        help="File containing EVN PC members (one per line) to auto-assign reviewers.",
+        help="File containing EVN PC members (`Name Email` per line, optional CODE#slot) to auto-assign reviewers.",
     )
     parser.add_argument(
         "-a",
@@ -771,7 +779,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.pc_members:
         try:
-            members, fixed_preferences = load_pc_members(args.pc_members)
+            members, fixed_preferences, _member_emails = load_pc_members(args.pc_members)
         except (FileNotFoundError, ValueError) as exc:
             print(exc, file=sys.stderr)
             return 1
