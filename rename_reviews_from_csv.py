@@ -27,6 +27,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+from textwrap import dedent
 from typing import Iterable, Optional, Sequence, Tuple
 
 
@@ -35,7 +36,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description=(
             "Rename existing review files from '<input> - Name Surname.ext' to "
             "'<prefix>_Name_Surname.ext'."
-        )
+        ),
+        epilog=dedent(
+            """\
+            Examples:
+              rename_reviews_from_csv.py pc_chair/EVN_PC_review_submission.csv --prefix E25A001
+              rename_reviews_from_csv.py responses.csv --prefix E25A002 --source-dir downloads --dest-dir reviews --dry-run
+            """
+        ),
     )
     parser.add_argument(
         "csv_path",
