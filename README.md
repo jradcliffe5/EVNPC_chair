@@ -25,3 +25,4 @@ Utility scripts to help the EVN Programme Committee chair prepare reviewer templ
 - `template.py` contains the low-level renderer used by `proposal_to_review_template.py`; it can also be used directly by piping ampersand-delimited records from legacy sources.
 - Sample member data is provided in `EVN_pc_members.txt`, including example email addresses. Update it each cycle so the automatic assignment logic remains accurate.
 - Run any script with `-h`/`--help` to view the full set of options and usage examples.
+- Need reminder drafts for manual sending? Run `python review_reminder.py --export-emails drafts_dir ...` to save each email as a `.txt` file ready for copy/paste.
