@@ -15,7 +15,9 @@ optional arguments:
   -o OUTPUT, --output OUTPUT
                         Write the formatted output to this file instead of stdout.
   -m PC_MEMBERS, --pc-members PC_MEMBERS
-                        File containing EVN PC members (one per line) to auto-assign reviewers.
+                        File containing EVN PC members (one per line) to auto-assign reviewers. If a member
+                        should always referee a specific proposal, append tokens like CODE#1 (first reviewer)
+                        or CODE#2 (second reviewer) after their name, e.g. "Jane Smith E25A001#1 E25A010#2".
   -a ASSIGNMENTS, --assignments ASSIGNMENTS
                         File to store reviewer assignments (defaults to reviewer_assignments.txt when --pc-members is used).
   --reviewers-per-proposal COUNT
@@ -35,7 +37,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from collections import defaultdict
 
 from template import render_record
@@ -415,7 +417,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
 
 
 def assign_reviewers(
-    proposals: List[dict[str, str]],
+    proposals: List[Dict[str, Any]],
     members: Sequence[str],
     reviewers_per_proposal: int,
     max_per_member: Optional[int] = None,
@@ -560,7 +562,7 @@ def assign_reviewers(
     return per_member
 
 
-def write_assignments(proposals: Sequence[dict[str, str]], destination: Path, roles: Sequence[str]) -> None:
+def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, roles: Sequence[str]) -> None:
     """Persist reviewer assignments to a simple CSV file."""
     roles = list(roles)
     max_count = max((len(proposal.get("reviewers", [])) for proposal in proposals), default=0)
@@ -603,7 +605,7 @@ def write_member_summary(assignments: Dict[str, List[Tuple[str, str]]], destinat
     destination.write_text(content, encoding="utf-8")
 
 
-def parse_proposal(path: Path) -> dict[str, str]:
+def parse_proposal(path: Path) -> Dict[str, Any]:
     """Derive structured proposal metadata from a PDF."""
     lines = extract_pdf_lines(path)
     exp, title, pi_hint = find_experiment_and_title(lines, path.stem)
@@ -753,7 +755,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("--reviewers-per-proposal must be at least 2.", file=sys.stderr)
         return 1
 
-    proposals: List[dict[str, str]] = []
+    proposals: List[Dict[str, Any]] = []
 
     for path in pdf_paths:
         try:
@@ -804,17 +806,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for proposal in proposals:
         proposal.pop("normalised_text", None)
         proposal.pop("participants", None)
-        additional_names = [name for _, name in proposal.get("reviewers", [])[2:]]
         rendered = list(
             render_record(
                 proposal["exp"],
-                proposal["pi"],
+                proposal["pi"].title(),
                 proposal["nets"],
                 proposal["lambda"],
                 proposal["title"],
                 proposal.get("first_reviewer"),
                 proposal.get("second_reviewer"),
-                additional_names if additional_names else None,
             )
         )
         output_lines.extend(rendered)
