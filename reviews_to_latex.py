@@ -88,7 +88,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Optional version string to display beneath the title.",
     )
     parser.add_argument(
-        "-m",
+        "-a",
         "--assignments",
         type=Path,
         default=None,
