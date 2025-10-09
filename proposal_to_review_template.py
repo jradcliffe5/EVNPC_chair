@@ -3,7 +3,7 @@
 
 Usage
 =====
-python pdf_to_template.py [-h] [-p PDF_DIR] [-o OUTPUT] [-m PC_MEMBERS] [-a ASSIGNMENTS] [pdfs ...]
+python proposal_to_review_template.py [-h] [-p PDF_DIR] [-o OUTPUT] [-m PC_MEMBERS] [-a ASSIGNMENTS] [pdfs ...]
 
 positional arguments:
   pdfs                  Specific PDF files to process. Defaults to all PDFs in --pdf-dir.
@@ -26,8 +26,8 @@ optional arguments:
   --member-summary FILE Write a per-member assignment summary to FILE.
 
 Examples:
-  python pdf_to_template.py -p test_proposals -m EVN_pc_members.txt
-  python pdf_to_template.py proposal.pdf another.pdf -m EVN_pc_members.txt -o summaries.txt
+  python proposal_to_review_template.py -p test_proposals -m EVN_pc_members.txt
+  python proposal_to_review_template.py proposal.pdf another.pdf -m EVN_pc_members.txt -o summaries.txt
 """
 
 from __future__ import annotations
