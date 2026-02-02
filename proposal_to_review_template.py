@@ -909,7 +909,11 @@ def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, ro
             conflict_lines.append(f"{proposal['exp']}: None")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    sections = ["\n".join(csv_lines)]
+    sections: List[str] = []
+    ascii_table = build_role_ascii_table(proposals, roles)
+    if ascii_table:
+        sections.append("Reviewer Summary:")
+        sections.append(ascii_table)
     if conflict_lines:
         sections.append("Conflicts:")
         sections.append("\n".join(conflict_lines))
@@ -930,6 +934,39 @@ def write_science_tags(proposals: Sequence[Dict[str, Any]], destination: Path) -
         content += "\n"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(content, encoding="utf-8")
+
+
+def build_role_ascii_table(proposals: Sequence[Dict[str, Any]], roles: Sequence[str]) -> str:
+    """Return an ASCII table listing each proposal and reviewer per role."""
+    roles = list(roles)
+    if not proposals or not roles:
+        return ""
+
+    headers = ["Proposal", *roles]
+    rows: List[List[str]] = []
+    for proposal in proposals:
+        role_map = {role: reviewer for role, reviewer in proposal.get("reviewers", [])}
+        row = [proposal["exp"], *[role_map.get(role, "") for role in roles]]
+        rows.append(row)
+
+    col_widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            col_widths[idx] = max(col_widths[idx], len(cell))
+
+    def fmt_row(values: List[str]) -> str:
+        parts = [
+            f" {value.ljust(col_widths[idx])} "
+            for idx, value in enumerate(values)
+        ]
+        return "|" + "|".join(parts) + "|"
+
+    border = "+" + "+".join("-" * (width + 2) for width in col_widths) + "+"
+    lines = [border, fmt_row(headers), border]
+    for row in rows:
+        lines.append(fmt_row(row))
+    lines.append(border)
+    return "\n".join(lines)
 
 
 def build_reviewer_email_table(
