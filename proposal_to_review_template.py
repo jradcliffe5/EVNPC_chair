@@ -29,6 +29,8 @@ optional arguments:
                         Maximum number of second-reviewer slots per PC member.
   --member-summary FILE Write a per-member HTML assignment table to FILE.
   --conflicts-file FILE Load additional conflicts from FILE (same format as reviewer_assignments appendix).
+  --science-tags-file FILE
+                        Write inferred science categories per proposal to FILE.
 
 Examples:
   python proposal_to_review_template.py -p test_proposals -m EVN_pc_members.txt
@@ -118,6 +120,109 @@ TITLE_PREFIXES = {
     "madam",
 }
 
+SCIENCE_CATEGORY_RULES: Dict[str, Tuple[Tuple[str, str, int], ...]] = {
+    "Galactic": (
+        ("keyword", "galactic", 2),
+        ("keyword", "milky way", 3),
+        ("keyword", "stellar", 1),
+        ("keyword", "star formation", 2),
+        ("keyword", "protostar", 2),
+        ("keyword", "brown dwarf", 2),
+        ("keyword", "molecular cloud", 2),
+        ("regex", r"\bpulsar(s)?\b", 3),
+        ("regex", r"\bpsr\b", 3),
+        ("regex", r"\b(binary|compact) star(s)?\b", 2),
+    ),
+    "Extragalactic": (
+        ("keyword", "extragalactic", 3),
+        ("keyword", "galaxy", 1),
+        ("keyword", "galaxies", 1),
+        ("keyword", "merger", 1),
+        ("keyword", "cluster", 1),
+        ("keyword", "intergalactic", 2),
+        ("keyword", "lensing", 2),
+        ("regex", r"\bjet(s)?\b", 1),
+        ("regex", r"\bradio galaxy\b", 3),
+    ),
+    "Spectral Line": (
+        ("keyword", "spectral line", 3),
+        ("keyword", "line emission", 2),
+        ("keyword", "absorption line", 2),
+        ("keyword", "maser", 3),
+        ("keyword", "masers", 3),
+        ("keyword", "molecular line", 2),
+        ("keyword", "molecular transition", 2),
+        ("keyword", "co(1-0)", 3),
+        ("keyword", "co(2-1)", 3),
+        ("keyword", "ammonia", 2),
+        ("keyword", "hi ", 2),
+        ("keyword", "h i", 2),
+        ("regex", r"\b21\s*cm\b", 2),
+    ),
+    "Transient": (
+        ("keyword", "transient", 3),
+        ("keyword", "transients", 3),
+        ("keyword", "burst", 2),
+        ("keyword", "afterglow", 2),
+        ("keyword", "flare", 1),
+        ("keyword", "tidal disruption", 3),
+        ("keyword", "fast radio burst", 4),
+        ("keyword", "frb", 3),
+        ("keyword", "grb", 3),
+    ),
+    "AGN": (
+        ("keyword", "agn", 3),
+        ("keyword", "active galactic nucleus", 4),
+        ("keyword", "active galactic nuclei", 4),
+        ("keyword", "blazar", 3),
+        ("keyword", "seyfert", 3),
+        ("keyword", "quasar", 3),
+        ("keyword", "core-jet", 2),
+        ("regex", r"\bagns\b", 2),
+    ),
+    "Supernovae": (
+        ("keyword", "supernova", 4),
+        ("keyword", "supernovae", 4),
+        ("regex", r"\bsn\s?\d+", 3),
+        ("keyword", "snr", 3),
+        ("keyword", "remnant", 2),
+        ("keyword", "nova remnant", 3),
+    ),
+}
+SCIENCE_CATEGORY_ALIAS_TERMS: Dict[str, str] = {
+    "galactic": "Galactic",
+    "milky way": "Galactic",
+    "stellar": "Galactic",
+    "star formation": "Galactic",
+    "pulsar": "Galactic",
+    "psr": "Galactic",
+    "extragalactic": "Extragalactic",
+    "galaxy": "Extragalactic",
+    "galaxies": "Extragalactic",
+    "cluster": "Extragalactic",
+    "spectral line": "Spectral Line",
+    "line emission": "Spectral Line",
+    "maser": "Spectral Line",
+    "molecular line": "Spectral Line",
+    "hi": "Spectral Line",
+    "transient": "Transient",
+    "burst": "Transient",
+    "frb": "Transient",
+    "grb": "Transient",
+    "agn": "AGN",
+    "active galactic nucleus": "AGN",
+    "blazar": "AGN",
+    "seyfert": "AGN",
+    "quasar": "AGN",
+    "supernova": "Supernovae",
+    "supernovae": "Supernovae",
+    "snr": "Supernovae",
+    "remnant": "Supernovae",
+    "other": "Other",
+}
+SCIENCE_CATEGORY_MIN_SCORE = 3
+SCIENCE_DEFAULT_CATEGORY = "Other"
+
 
 def normalise_name(name: str) -> str:
     """Return a lowercase, punctuation-free version of a personal name."""
@@ -128,6 +233,69 @@ def normalise_name(name: str) -> str:
     tokens = cleaned.split()
     filtered_tokens = [token for token in tokens if token not in TITLE_PREFIXES]
     return " ".join(filtered_tokens) if filtered_tokens else cleaned
+
+
+def infer_science_categories(title: str, lines: Sequence[str]) -> List[str]:
+    """Return a list of science categories inferred from free text and declared fields."""
+    declared = _extract_declared_science_categories(lines)
+    if declared:
+        return declared
+
+    haystack_parts = [title.lower()]
+    haystack_parts.extend(line.lower() for line in lines if line.strip())
+    haystack = " ".join(haystack_parts)
+    scores: Dict[str, int] = {category: 0 for category in SCIENCE_CATEGORY_RULES}
+
+    for category, rules in SCIENCE_CATEGORY_RULES.items():
+        for rule_type, pattern, weight in rules:
+            if rule_type == "keyword":
+                if pattern in haystack:
+                    scores[category] += weight
+            elif rule_type == "regex":
+                if re.search(pattern, haystack):
+                    scores[category] += weight
+
+    selected = [cat for cat, value in scores.items() if value >= SCIENCE_CATEGORY_MIN_SCORE]
+    if not selected:
+        max_score = max(scores.values(), default=0)
+        if max_score > 0:
+            selected = [cat for cat, value in scores.items() if value == max_score]
+    if not selected:
+        selected = [SCIENCE_DEFAULT_CATEGORY]
+    return sorted(set(selected))
+
+
+def _extract_declared_science_categories(lines: Sequence[str]) -> List[str]:
+    categories: List[str] = []
+    pending = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        lower = line.lower()
+        if pending:
+            categories.extend(_science_aliases_from_text(lower))
+            pending = False
+            continue
+        if "scientific category" in lower or "science category" in lower or lower.startswith("category"):
+            if ":" in line:
+                _, _, remainder = line.partition(":")
+                categories.extend(_science_aliases_from_text(remainder.lower()))
+            else:
+                pending = True
+    return sorted(set(categories))
+
+
+def _science_aliases_from_text(text: str) -> List[str]:
+    categories: List[str] = []
+    parts = re.split(r"[;,/]| and |\s{2,}", text)
+    for part in parts:
+        chunk = part.strip()
+        if not chunk:
+            continue
+        for alias, category in SCIENCE_CATEGORY_ALIAS_TERMS.items():
+            if alias in chunk:
+                categories.append(category)
+                break
+    return categories
 
 
 class PdfExtractError(RuntimeError):
@@ -719,6 +887,19 @@ def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, ro
     destination.write_text(content, encoding="utf-8")
 
 
+def write_science_tags(proposals: Sequence[Dict[str, Any]], destination: Path) -> None:
+    """Write inferred science categories per proposal."""
+    lines: List[str] = []
+    for proposal in proposals:
+        tags = proposal.get("science_tags") or [SCIENCE_DEFAULT_CATEGORY]
+        lines.append(f"{proposal['exp']}: {', '.join(tags)}")
+    content = "\n".join(lines)
+    if not content.endswith("\n"):
+        content += "\n"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding="utf-8")
+
+
 def build_reviewer_email_table(assignments: Dict[str, List[Tuple[str, str]]], roles: Sequence[str]) -> str:
     """Return an HTML table summarizing per-reviewer assignments by role."""
     if not assignments:
@@ -827,6 +1008,7 @@ def parse_proposal(path: Path) -> Dict[str, Any]:
     networks, wavebands = parse_summary(lines)
     nets = ", ".join(networks)
     lambdas = ", ".join(wavebands)
+    science_tags = infer_science_categories(title, lines)
 
     return {
         "exp": exp,
@@ -836,6 +1018,7 @@ def parse_proposal(path: Path) -> Dict[str, Any]:
         "lambda": lambdas,
         "participants": participants,
         "normalised_text": normalised_text,
+        "science_tags": science_tags,
     }
 
 
@@ -939,6 +1122,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--conflicts-file",
         type=Path,
         help="Optional file listing per-proposal conflicts (same format as the reviewer assignment appendix).",
+    )
+    parser.add_argument(
+        "--science-tags-file",
+        type=Path,
+        help="Write inferred science categories per proposal to this file.",
     )
     args = parser.parse_args(argv)
 
@@ -1081,6 +1269,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         for line in output_lines:
             print(line)
+
+    if args.science_tags_file:
+        try:
+            write_science_tags(proposals, args.science_tags_file)
+        except OSError as exc:
+            print(f"Failed to write science tags file: {exc}", file=sys.stderr)
+            return 1
 
     return 0
 
