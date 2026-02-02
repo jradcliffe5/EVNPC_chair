@@ -28,6 +28,7 @@ optional arguments:
   --max-second-per-member COUNT
                         Maximum number of second-reviewer slots per PC member.
   --member-summary FILE Write a per-member HTML assignment table to FILE.
+  --conflicts-file FILE Load additional conflicts from FILE (same format as reviewer_assignments appendix).
 
 Examples:
   python proposal_to_review_template.py -p test_proposals -m EVN_pc_members.txt
@@ -375,7 +376,10 @@ def parse_summary(lines: Sequence[str]) -> tuple[List[str], List[str]]:
 
 
 def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]], Dict[str, str], Set[str]]:
-    """Read PC member entries and return names, fixed reviewer preferences, email mapping, and chair markers."""
+    """Read PC member entries and return names, fixed reviewer preferences, email mapping, and chair markers.
+
+    Appending `*` to any part of a member's name marks them as a chair who should receive leftover assignments.
+    """
     try:
         content = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -438,6 +442,32 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
     return members, fixed, emails, chairs
 
 
+def load_conflicts_file(path: Path) -> Dict[str, Set[str]]:
+    """Parse a conflicts file formatted like the reviewer_assignments appendix."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FileNotFoundError(f"Unable to read conflicts file: {path}") from exc
+
+    conflicts: Dict[str, Set[str]] = defaultdict(set)
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower() == "conflicts:":
+            continue
+        if ":" not in line:
+            continue
+        proposal_code, names = line.split(":", 1)
+        proposal_code = proposal_code.strip()
+        if not proposal_code:
+            continue
+        entries = [entry.strip() for entry in names.split(",") if entry.strip()]
+        if not entries or (len(entries) == 1 and entries[0].lower() == "none"):
+            continue
+        for entry in entries:
+            conflicts[proposal_code].add(entry)
+    return conflicts
+
+
 def assign_reviewers(
     proposals: List[Dict[str, Any]],
     members: Sequence[str],
@@ -447,8 +477,9 @@ def assign_reviewers(
     max_first_per_member: Optional[int] = None,
     max_second_per_member: Optional[int] = None,
     chair_members: Optional[Set[str]] = None,
+    manual_conflicts: Optional[Dict[str, Set[str]]] = None,
 ) -> Dict[str, List[Tuple[str, str]]]:
-    """Assign first and second reviewers while balancing load, avoiding conflicts, and respecting limits."""
+    """Assign reviewers while balancing load, respecting per-role limits, and prioritising chairs for leftovers."""
     if not members:
         raise ValueError("Cannot assign reviewers without PC members.")
     if reviewers_per_proposal < 2:
@@ -479,6 +510,9 @@ def assign_reviewers(
         raise ValueError("PC member list does not contain valid names.")
     per_member: Dict[str, List[Tuple[str, str]]] = {info["name"]: [] for info in member_infos}
     members_by_name: Dict[str, dict] = {info["name"]: info for info in member_infos}
+    members_by_normalised: Dict[str, str] = {
+        info["normalised"]: info["name"] for info in member_infos if info["normalised"]
+    }
     role_labels = generate_role_labels(reviewers_per_proposal)
 
     fixed_first_map: Dict[str, str] = {}
@@ -519,7 +553,7 @@ def assign_reviewers(
             member["second_count"] += 1
 
     def priority_key(member: dict, role: str) -> Tuple[int, int, int, int]:
-        """Return a tuple used to balance role-specific assignments."""
+        """Return a tuple used to balance role-specific assignments (chairs soak up leftovers)."""
         chair_bias = 0 if member.get("is_chair") else 1
         if role == "First Reviewer":
             return (member["first_count"], chair_bias, member["count"], member["order"])
@@ -584,8 +618,10 @@ def assign_reviewers(
         per_member[member_name].append((proposal_code, role))
 
     for proposal in proposals:
+        proposal_code = proposal["exp"]
         participants: Set[str] = set(proposal.get("participants", set()))
         excluded = set(participants)
+        # Capture everyone we exclude so the CSV can describe conflicts explicitly.
         conflicts: Set[str] = set()
         if participants:
             for member in member_infos:
@@ -599,9 +635,18 @@ def assign_reviewers(
                 if norm and f" {norm} " in text_blob:
                     excluded.add(norm)
                     conflicts.add(member["name"])
+        if manual_conflicts:
+            extra_conflicts = manual_conflicts.get(proposal_code, set())
+            for entry in extra_conflicts:
+                resolved_name = entry.strip()
+                norm = normalise_name(resolved_name)
+                if norm:
+                    excluded.add(norm)
+                    resolved_name = members_by_normalised.get(norm, resolved_name)
+                if resolved_name:
+                    conflicts.add(resolved_name)
         chosen: Set[str] = set()
         reviewers: List[Tuple[str, str]] = []
-        proposal_code = proposal["exp"]
         fixed_slots: List[Optional[str]] = [None] * reviewers_per_proposal
         fixed_first = fixed_first_map.get(proposal_code)
         fixed_second = fixed_second_map.get(proposal_code)
@@ -637,7 +682,7 @@ def assign_reviewers(
 
 
 def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, roles: Sequence[str]) -> None:
-    """Persist reviewer assignments to a CSV file."""
+    """Persist reviewer assignments to a CSV file and append a conflicts appendix."""
     roles = list(roles)
     max_count = max((len(proposal.get("reviewers", [])) for proposal in proposals), default=0)
     if max_count > len(roles):
@@ -890,6 +935,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=Path,
         help="Write a per-member HTML assignment table to this file.",
     )
+    parser.add_argument(
+        "--conflicts-file",
+        type=Path,
+        help="Optional file listing per-proposal conflicts (same format as the reviewer assignment appendix).",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -908,6 +958,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         or args.member_summary
         or args.max_first_per_member
         or args.max_second_per_member
+        or args.conflicts_file
     ) and not args.pc_members:
         print("Reviewer-related options require --pc-members to be specified.", file=sys.stderr)
         return 1
@@ -928,6 +979,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     member_assignments: Optional[Dict[str, List[Tuple[str, str]]]] = None
     role_labels: Optional[List[str]] = None
+    manual_conflicts: Dict[str, Set[str]] = {}
+
+    if args.conflicts_file:
+        try:
+            manual_conflicts = load_conflicts_file(args.conflicts_file)
+        except (FileNotFoundError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 1
 
     if args.pc_members:
         try:
@@ -975,6 +1034,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.max_first_per_member,
                 args.max_second_per_member,
                 chair_members,
+                manual_conflicts or None,
             )
         except ValueError as exc:
             print(exc, file=sys.stderr)
