@@ -909,7 +909,7 @@ def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, ro
             conflict_lines.append(f"{proposal['exp']}: None")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
-    sections: List[str] = []
+    sections = ["\n".join(csv_lines)]
     ascii_table = build_role_ascii_table(proposals, roles)
     if ascii_table:
         sections.append("Reviewer Summary:")
