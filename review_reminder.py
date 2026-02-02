@@ -92,7 +92,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--smtp-server",
-        help="SMTP server hostname. When omitted, reminders are only printed.",
+        default="smtp.gmail.com",
+        help="SMTP server hostname (default: smtp.gmail.com).",
     )
     parser.add_argument(
         "--smtp-port",
@@ -350,17 +351,18 @@ def send_reminder_email(
 
     export_email_draft(reminder, subject, body, today, args)
 
-    if not args.smtp_server:
-        print(format_reminder_text(reminder, today), flush=True)
-        return
-
     if not reminder.email:
         print(format_reminder_text(reminder, today), flush=True)
         print("  (No email address available; reminder not sent.)")
         return
 
     if args.dry_run:
-        print(f"[DRY-RUN] Would send to {reminder.email} :: {subject}\n{body}\n", flush=True)
+        server_display = f"{args.smtp_server}:{args.smtp_port}" if args.smtp_server else "SMTP"
+        cc_display = f" CC={', '.join(args.cc)}" if args.cc else ""
+        print(
+            f"[DRY-RUN] Would send via {server_display} to {reminder.email}{cc_display} :: {subject}\n{body}\n",
+            flush=True,
+        )
         return
 
     sender = args.from_address or args.smtp_username
@@ -377,7 +379,11 @@ def send_reminder_email(
         message["Cc"] = ", ".join(args.cc)
     message.set_content(body)
 
+    server_display = f"{args.smtp_server}:{args.smtp_port}" if args.smtp_server else "SMTP"
+    cc_display = f" CC={', '.join(args.cc)}" if args.cc else ""
+    print(f"[SENDING] via {server_display} to {reminder.email}{cc_display} :: {subject}", flush=True)
     deliver_email(args, message)
+    print(f"[SENT] {reminder.email} ({reminder.reviewer})", flush=True)
 
 
 def deliver_email(args: argparse.Namespace, message: EmailMessage) -> None:
@@ -498,7 +504,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     try:
-        _member_names, _fixed, member_emails = load_pc_members(args.pc_members)
+        _member_names, _fixed, member_emails, _chairs = load_pc_members(args.pc_members)
     except (FileNotFoundError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1

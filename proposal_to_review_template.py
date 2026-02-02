@@ -23,7 +23,11 @@ optional arguments:
   --reviewers-per-proposal COUNT
                         Total reviewers to assign per proposal (minimum 2, default 2).
   --max-per-member MAX  Maximum number of proposals assigned to any single PC member.
-  --member-summary FILE Write a per-member assignment summary to FILE.
+  --max-first-per-member COUNT
+                        Maximum number of first-reviewer slots per PC member.
+  --max-second-per-member COUNT
+                        Maximum number of second-reviewer slots per PC member.
+  --member-summary FILE Write a per-member HTML assignment table to FILE.
 
 Examples:
   python proposal_to_review_template.py -p test_proposals -m EVN_pc_members.txt
@@ -33,6 +37,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import html
 import re
 import subprocess
 import sys
@@ -369,8 +374,8 @@ def parse_summary(lines: Sequence[str]) -> tuple[List[str], List[str]]:
     return networks, wavebands
 
 
-def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]], Dict[str, str]]:
-    """Read PC member entries and return names, fixed reviewer preferences, and email mapping."""
+def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]], Dict[str, str], Set[str]]:
+    """Read PC member entries and return names, fixed reviewer preferences, email mapping, and chair markers."""
     try:
         content = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -379,6 +384,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
     members: List[str] = []
     fixed: Dict[str, Dict[str, List[str]]] = {}
     emails: Dict[str, str] = {}
+    chairs: Set[str] = set()
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -388,6 +394,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
         first_fixed: List[str] = []
         second_fixed: List[str] = []
         email: Optional[str] = None
+        is_chair = False
         for token in tokens:
             if "#" in token:
                 try:
@@ -406,11 +413,18 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
                 if cleaned_email:
                     email = cleaned_email
             else:
-                name_tokens.append(token)
+                chair_token = "*" in token
+                cleaned_token = token.replace("*", "")
+                if cleaned_token:
+                    name_tokens.append(cleaned_token)
+                if chair_token:
+                    is_chair = True
         name = " ".join(name_tokens).strip()
         if not name:
             continue
         members.append(name)
+        if is_chair:
+            chairs.add(name)
         if first_fixed or second_fixed:
             fixed[name] = {
                 "first": first_fixed,
@@ -421,7 +435,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
 
     if not members:
         raise ValueError(f"No PC members found in {path}")
-    return members, fixed, emails
+    return members, fixed, emails, chairs
 
 
 def assign_reviewers(
@@ -430,6 +444,9 @@ def assign_reviewers(
     reviewers_per_proposal: int,
     max_per_member: Optional[int] = None,
     fixed_preferences: Optional[Dict[str, Dict[str, List[str]]]] = None,
+    max_first_per_member: Optional[int] = None,
+    max_second_per_member: Optional[int] = None,
+    chair_members: Optional[Set[str]] = None,
 ) -> Dict[str, List[Tuple[str, str]]]:
     """Assign first and second reviewers while balancing load, avoiding conflicts, and respecting limits."""
     if not members:
@@ -438,13 +455,21 @@ def assign_reviewers(
         raise ValueError("Each proposal must have at least two reviewers.")
     if max_per_member is not None and max_per_member <= 0:
         raise ValueError("Maximum proposals per member must be positive.")
+    if max_first_per_member is not None and max_first_per_member <= 0:
+        raise ValueError("Maximum first-reviewer assignments per member must be positive.")
+    if max_second_per_member is not None and max_second_per_member <= 0:
+        raise ValueError("Maximum second-reviewer assignments per member must be positive.")
     if reviewers_per_proposal > len(members):
         raise ValueError("Not enough PC members to satisfy reviewers-per-proposal.")
+    chair_members = chair_members or set()
     member_infos = [
         {
             "name": name,
             "normalised": normalise_name(name),
             "count": 0,
+            "first_count": 0,
+            "second_count": 0,
+            "is_chair": name in chair_members,
             "order": idx,
         }
         for idx, name in enumerate(members)
@@ -477,13 +502,39 @@ def assign_reviewers(
                     raise ValueError(f"Conflicting second reviewer assignment for proposal {code}.")
                 fixed_second_map[code] = member_name
 
-    def select_member(excluded: Set[str], already_chosen: Set[str]) -> dict:
+    def has_capacity(member: dict, role: str) -> bool:
+        if role == "First Reviewer" and max_first_per_member is not None:
+            if member["first_count"] >= max_first_per_member:
+                return False
+        if role == "Second Reviewer" and max_second_per_member is not None:
+            if member["second_count"] >= max_second_per_member:
+                return False
+        return True
+
+    def record_assignment(member: dict, role: str) -> None:
+        member["count"] += 1
+        if role == "First Reviewer":
+            member["first_count"] += 1
+        elif role == "Second Reviewer":
+            member["second_count"] += 1
+
+    def priority_key(member: dict, role: str) -> Tuple[int, int, int, int]:
+        """Return a tuple used to balance role-specific assignments."""
+        chair_bias = 0 if member.get("is_chair") else 1
+        if role == "First Reviewer":
+            return (member["first_count"], chair_bias, member["count"], member["order"])
+        if role == "Second Reviewer":
+            return (member["second_count"], chair_bias, member["count"], member["order"])
+        return (member["count"], chair_bias, member["order"], 0)
+
+    def select_member(excluded: Set[str], already_chosen: Set[str], role: str) -> dict:
         eligible = [
             member
             for member in member_infos
             if member["normalised"] not in excluded
             and member["normalised"] not in already_chosen
             and (max_per_member is None or member["count"] < max_per_member)
+            and has_capacity(member, role)
         ]
         if not eligible:
             eligible = [
@@ -491,11 +542,11 @@ def assign_reviewers(
                 for member in member_infos
                 if member["normalised"] not in excluded
                 and (max_per_member is None or member["count"] < max_per_member)
+                and has_capacity(member, role)
             ]
         if not eligible:
             raise ValueError("No available reviewers remaining for assignment within limits.")
-        chosen = min(eligible, key=lambda m: (m["count"], m["order"]))
-        chosen["count"] += 1
+        chosen = min(eligible, key=lambda m: priority_key(m, role))
         return chosen
 
     def apply_fixed_member(
@@ -521,20 +572,33 @@ def assign_reviewers(
             raise ValueError(
                 f"Fixed reviewer '{member_name}' exceeds the maximum assignments ({max_per_member})."
             )
-        member["count"] += 1
-        already_chosen.add(member["normalised"])
         role = role_labels[role_idx]
+        if not has_capacity(member, role):
+            limit_label = "first" if role == "First Reviewer" else "second"
+            raise ValueError(
+                f"Fixed reviewer '{member_name}' exceeds the maximum {limit_label}-reviewer assignments."
+            )
+        record_assignment(member, role)
+        already_chosen.add(member["normalised"])
         reviewers.append((role, member_name))
         per_member[member_name].append((proposal_code, role))
 
     for proposal in proposals:
-        excluded = set(proposal.get("participants", set()))
+        participants: Set[str] = set(proposal.get("participants", set()))
+        excluded = set(participants)
+        conflicts: Set[str] = set()
+        if participants:
+            for member in member_infos:
+                norm = member["normalised"]
+                if norm and norm in participants:
+                    conflicts.add(member["name"])
         text_blob = proposal.get("normalised_text", "")
         if text_blob:
             for member in member_infos:
                 norm = member["normalised"]
                 if norm and f" {norm} " in text_blob:
                     excluded.add(norm)
+                    conflicts.add(member["name"])
         chosen: Set[str] = set()
         reviewers: List[Tuple[str, str]] = []
         proposal_code = proposal["exp"]
@@ -554,24 +618,26 @@ def assign_reviewers(
 
         for idx in range(reviewers_per_proposal):
             fixed_member = fixed_slots[idx]
+            role = role_labels[idx]
             if fixed_member:
                 apply_fixed_member(fixed_member, idx, proposal_code, excluded, chosen, reviewers)
                 continue
-            member = select_member(excluded, chosen)
+            member = select_member(excluded, chosen, role)
             chosen.add(member["normalised"])
-            role = role_labels[idx]
+            record_assignment(member, role)
             reviewers.append((role, member["name"]))
             per_member[member["name"]].append((proposal_code, role))
 
         proposal["reviewers"] = reviewers
         proposal["first_reviewer"] = reviewers[0][1]
         proposal["second_reviewer"] = reviewers[1][1]
+        proposal["conflicts"] = sorted(conflicts)
 
     return per_member
 
 
 def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, roles: Sequence[str]) -> None:
-    """Persist reviewer assignments to a simple CSV file."""
+    """Persist reviewer assignments to a CSV file."""
     roles = list(roles)
     max_count = max((len(proposal.get("reviewers", [])) for proposal in proposals), default=0)
     if max_count > len(roles):
@@ -579,38 +645,106 @@ def write_assignments(proposals: Sequence[Dict[str, Any]], destination: Path, ro
         roles.extend(extra_roles)
 
     header = ["Proposal", *roles]
-    lines = [",".join(header)]
+    csv_lines = [",".join(header)]
+
     for proposal in proposals:
         row = [proposal["exp"]]
         reviewers = proposal.get("reviewers", [])
         role_map = {role: name for role, name in reviewers}
         for role in roles:
             row.append(role_map.get(role, ""))
-        lines.append(",".join(row))
+        csv_lines.append(",".join(row))
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(lines)
-    if not content.endswith("\n"):
-        content += "\n"
-    destination.write_text(content, encoding="utf-8")
-
-
-def write_member_summary(assignments: Dict[str, List[Tuple[str, str]]], destination: Path) -> None:
-    """Persist per-member assignments as a readable text report."""
-    lines: List[str] = []
-    for member in sorted(assignments.keys(), key=str.lower):
-        tasks = assignments[member]
-        if tasks:
-            formatted = ", ".join(f"{proposal} ({role})" for proposal, role in tasks)
-            lines.append(f"{member}: {formatted}")
+    conflict_lines: List[str] = []
+    for proposal in proposals:
+        conflicts = proposal.get("conflicts") or []
+        if conflicts:
+            conflict_lines.append(f"{proposal['exp']}: {', '.join(conflicts)}")
         else:
-            lines.append(f"{member}:")
+            conflict_lines.append(f"{proposal['exp']}: None")
 
-    content = "\n".join(lines)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    sections = ["\n".join(csv_lines)]
+    if conflict_lines:
+        sections.append("Conflicts:")
+        sections.append("\n".join(conflict_lines))
+    content = "\n\n".join(sections)
     if not content.endswith("\n"):
         content += "\n"
-    destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(content, encoding="utf-8")
+
+
+def build_reviewer_email_table(assignments: Dict[str, List[Tuple[str, str]]], roles: Sequence[str]) -> str:
+    """Return an HTML table summarizing per-reviewer assignments by role."""
+    if not assignments:
+        return ""
+
+    base_roles: List[str] = []
+    extra_roles: List[str] = []
+    for role in roles:
+        if role.lower().startswith("additional reviewer"):
+            extra_roles.append(role)
+        else:
+            base_roles.append(role)
+
+    headers = ["Reviewer", *base_roles]
+    if extra_roles:
+        headers.append("Additional Reviewers")
+
+    lines = [
+        '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;">',
+        "  <thead>",
+        "    <tr>"
+        + "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+        + "</tr>",
+        "  </thead>",
+        "  <tbody>",
+    ]
+
+    for reviewer in sorted(assignments.keys(), key=str.lower):
+        row_cells: List[str] = [html.escape(reviewer)]
+        slot_map: Dict[str, List[str]] = defaultdict(list)
+        for proposal_code, role in assignments[reviewer]:
+            slot_map[role].append(proposal_code)
+        for role in base_roles:
+            entries = slot_map.get(role)
+            row_cells.append(format_assignment_entries(entries))
+        if extra_roles:
+            combined: List[str] = []
+            for role in extra_roles:
+                combined.extend(slot_map.get(role, []))
+            row_cells.append(format_assignment_entries(combined))
+        lines.append("    <tr>" + "".join(f"<td>{cell}</td>" for cell in row_cells) + "</tr>")
+
+    lines.append("  </tbody>")
+    lines.append("</table>")
+
+    return "\n".join(lines)
+
+
+def format_assignment_entries(entries: Optional[Sequence[str]]) -> str:
+    """Format assignment codes for a table cell."""
+    if not entries:
+        return ""
+    return ", ".join(html.escape(entry) for entry in entries)
+
+
+def write_member_summary(assignments: Dict[str, List[Tuple[str, str]]], destination: Path, roles: Sequence[str]) -> None:
+    """Persist per-member assignments as an HTML table for easy emailing."""
+    table_html = build_reviewer_email_table(assignments, roles)
+    if not table_html:
+        table_html = "<p>No reviewer assignments available.</p>"
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    html_content = "\n".join(
+        [
+            "<!-- Reviewer assignments for Outlook. Paste the table below into the email body. -->",
+            table_html,
+        ]
+    )
+    if not html_content.endswith("\n"):
+        html_content += "\n"
+    destination.write_text(html_content, encoding="utf-8")
 
 
 def parse_proposal(path: Path) -> Dict[str, Any]:
@@ -740,9 +874,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Maximum number of proposals assigned to any single PC member.",
     )
     parser.add_argument(
+        "--max-first-per-member",
+        type=int,
+        metavar="COUNT",
+        help="Maximum number of first reviewer assignments per PC member.",
+    )
+    parser.add_argument(
+        "--max-second-per-member",
+        type=int,
+        metavar="COUNT",
+        help="Maximum number of second reviewer assignments per PC member.",
+    )
+    parser.add_argument(
         "--member-summary",
         type=Path,
-        help="Write a per-member assignment summary to this file.",
+        help="Write a per-member HTML assignment table to this file.",
     )
     args = parser.parse_args(argv)
 
@@ -756,7 +902,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("No proposal PDFs found.", file=sys.stderr)
         return 1
 
-    if (args.assignments or args.max_per_member or args.member_summary) and not args.pc_members:
+    if (
+        args.assignments
+        or args.max_per_member
+        or args.member_summary
+        or args.max_first_per_member
+        or args.max_second_per_member
+    ) and not args.pc_members:
         print("Reviewer-related options require --pc-members to be specified.", file=sys.stderr)
         return 1
     if args.reviewers_per_proposal < 2:
@@ -779,10 +931,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.pc_members:
         try:
-            members, fixed_preferences, _member_emails = load_pc_members(args.pc_members)
+            members, fixed_preferences, _member_emails, chair_members = load_pc_members(args.pc_members)
         except (FileNotFoundError, ValueError) as exc:
             print(exc, file=sys.stderr)
             return 1
+        proposal_count = len(proposals)
+        member_count = len(members)
+        if args.max_first_per_member is not None and member_count * args.max_first_per_member < proposal_count:
+            print(
+                f"Insufficient first-reviewer capacity: need {proposal_count} slots for {proposal_count} proposals, "
+                f"but --max-first-per-member={args.max_first_per_member} with {member_count} members allows only "
+                f"{member_count * args.max_first_per_member}. Increase the limit or add more members.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.max_second_per_member is not None and member_count * args.max_second_per_member < proposal_count:
+            print(
+                f"Insufficient second-reviewer capacity: need {proposal_count} slots for {proposal_count} proposals, "
+                f"but --max-second-per-member={args.max_second_per_member} with {member_count} members allows only "
+                f"{member_count * args.max_second_per_member}. Increase the limit or add more members.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.max_per_member is not None:
+            total_required = proposal_count * args.reviewers_per_proposal
+            total_capacity = member_count * args.max_per_member
+            if total_capacity < total_required:
+                print(
+                    f"Insufficient reviewer capacity: assignments require {total_required} slots "
+                    f"({proposal_count} proposals × {args.reviewers_per_proposal} reviewers), "
+                    f"but --max-per-member={args.max_per_member} with {member_count} members allows only {total_capacity}.",
+                    file=sys.stderr,
+                )
+                return 1
         try:
             role_labels = generate_role_labels(args.reviewers_per_proposal)
             member_assignments = assign_reviewers(
@@ -791,6 +972,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.reviewers_per_proposal,
                 args.max_per_member,
                 fixed_preferences,
+                args.max_first_per_member,
+                args.max_second_per_member,
+                chair_members,
             )
         except ValueError as exc:
             print(exc, file=sys.stderr)
@@ -804,7 +988,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         if args.member_summary and member_assignments is not None:
             try:
-                write_member_summary(member_assignments, args.member_summary)
+                write_member_summary(member_assignments, args.member_summary, role_labels or [])
             except OSError as exc:
                 print(f"Failed to write member summary: {exc}", file=sys.stderr)
                 return 1
