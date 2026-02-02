@@ -504,7 +504,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     try:
-        _member_names, _fixed, member_emails, _chairs = load_pc_members(args.pc_members)
+        _member_names, _fixed, member_emails, _chairs, _tags = load_pc_members(args.pc_members)
     except (FileNotFoundError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1

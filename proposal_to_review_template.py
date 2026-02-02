@@ -16,21 +16,23 @@ optional arguments:
                         Write the formatted output to this file instead of stdout.
   -m PC_MEMBERS, --pc-members PC_MEMBERS
                         File containing EVN PC members (one per line) to auto-assign reviewers. If a member
-                        should always referee a specific proposal, append tokens like CODE#1 (first reviewer)
-                        or CODE#2 (second reviewer) after their name, e.g. "Jane Smith E25A001#1 E25A010#2".
+                        should always referee a specific proposal, append tokens like CODE#1 (primary reviewer)
+                        or CODE#2 (secondary reviewer) after their name, e.g. "Jane Smith E25A001#1 E25A010#2".
   -a ASSIGNMENTS, --assignments ASSIGNMENTS
                         File to store reviewer assignments (defaults to reviewer_assignments.txt when --pc-members is used).
   --reviewers-per-proposal COUNT
                         Total reviewers to assign per proposal (minimum 2, default 2).
   --max-per-member MAX  Maximum number of proposals assigned to any single PC member.
   --max-first-per-member COUNT
-                        Maximum number of first-reviewer slots per PC member.
+                        Maximum number of primary-reviewer slots per PC member.
   --max-second-per-member COUNT
-                        Maximum number of second-reviewer slots per PC member.
+                        Maximum number of secondary-reviewer slots per PC member.
   --member-summary FILE Write a per-member HTML assignment table to FILE.
   --conflicts-file FILE Load additional conflicts from FILE (same format as reviewer_assignments appendix).
   --science-tags-file FILE
                         Write inferred science categories per proposal to FILE.
+  --prefer-matching-tags
+                        Prefer assigning primary reviewers whose expertise tags match the proposal's science tags.
 
 Examples:
   python proposal_to_review_template.py -p test_proposals -m EVN_pc_members.txt
@@ -60,11 +62,11 @@ def generate_role_labels(count: int) -> List[str]:
     labels: List[str] = []
     for idx in range(count):
         if idx == 0:
-            labels.append("First Reviewer")
+            labels.append("Primary Reviewer")
         elif idx == 1:
-            labels.append("Second Reviewer")
+            labels.append("Secondary Reviewer")
         else:
-            labels.append(f"Additional Reviewer {idx - 1}")
+            labels.append(f"Additional Review {idx - 1}")
     return labels
 
 # Known network keywords to capture from the summary table.
@@ -194,6 +196,7 @@ SCIENCE_CATEGORY_ALIAS_TERMS: Dict[str, str] = {
     "milky way": "Galactic",
     "stellar": "Galactic",
     "star formation": "Galactic",
+    "starformation": "Galactic",
     "pulsar": "Galactic",
     "psr": "Galactic",
     "extragalactic": "Extragalactic",
@@ -201,15 +204,19 @@ SCIENCE_CATEGORY_ALIAS_TERMS: Dict[str, str] = {
     "galaxies": "Extragalactic",
     "cluster": "Extragalactic",
     "spectral line": "Spectral Line",
+    "spectralline": "Spectral Line",
     "line emission": "Spectral Line",
     "maser": "Spectral Line",
     "molecular line": "Spectral Line",
+    "molecularline": "Spectral Line",
     "hi": "Spectral Line",
     "transient": "Transient",
+    "transients": "Transient",
     "burst": "Transient",
     "frb": "Transient",
     "grb": "Transient",
     "agn": "AGN",
+    "agns": "AGN",
     "active galactic nucleus": "AGN",
     "blazar": "AGN",
     "seyfert": "AGN",
@@ -543,8 +550,8 @@ def parse_summary(lines: Sequence[str]) -> tuple[List[str], List[str]]:
     return networks, wavebands
 
 
-def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]], Dict[str, str], Set[str]]:
-    """Read PC member entries and return names, fixed reviewer preferences, email mapping, and chair markers.
+def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str]]], Dict[str, str], Set[str], Dict[str, Set[str]]]:
+    """Read PC member entries and return names, fixed reviewer preferences, email mapping, chair markers, and science tags.
 
     Appending `*` to any part of a member's name marks them as a chair who should receive leftover assignments.
     """
@@ -557,6 +564,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
     fixed: Dict[str, Dict[str, List[str]]] = {}
     emails: Dict[str, str] = {}
     chairs: Set[str] = set()
+    member_tags: Dict[str, Set[str]] = {}
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -567,6 +575,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
         second_fixed: List[str] = []
         email: Optional[str] = None
         is_chair = False
+        tags: Set[str] = set()
         for token in tokens:
             if "#" in token:
                 try:
@@ -587,8 +596,13 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
             else:
                 chair_token = "*" in token
                 cleaned_token = token.replace("*", "")
+                normalized_for_alias = re.sub(r"[^\w\s-]", "", cleaned_token)
+                lower_cleaned = normalized_for_alias.lower()
+                if lower_cleaned in SCIENCE_CATEGORY_ALIAS_TERMS:
+                    tags.add(SCIENCE_CATEGORY_ALIAS_TERMS[lower_cleaned])
+                    continue
                 if cleaned_token:
-                    name_tokens.append(cleaned_token)
+                    name_tokens.append(cleaned_token.strip(",;"))
                 if chair_token:
                     is_chair = True
         name = " ".join(name_tokens).strip()
@@ -597,6 +611,8 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
         members.append(name)
         if is_chair:
             chairs.add(name)
+        if tags:
+            member_tags[name] = tags
         if first_fixed or second_fixed:
             fixed[name] = {
                 "first": first_fixed,
@@ -607,7 +623,7 @@ def load_pc_members(path: Path) -> Tuple[List[str], Dict[str, Dict[str, List[str
 
     if not members:
         raise ValueError(f"No PC members found in {path}")
-    return members, fixed, emails, chairs
+    return members, fixed, emails, chairs, member_tags
 
 
 def load_conflicts_file(path: Path) -> Dict[str, Set[str]]:
@@ -646,8 +662,10 @@ def assign_reviewers(
     max_second_per_member: Optional[int] = None,
     chair_members: Optional[Set[str]] = None,
     manual_conflicts: Optional[Dict[str, Set[str]]] = None,
+    prefer_science_tags: bool = False,
+    member_science_tags: Optional[Dict[str, Set[str]]] = None,
 ) -> Dict[str, List[Tuple[str, str]]]:
-    """Assign reviewers while balancing load, respecting per-role limits, and prioritising chairs for leftovers."""
+    """Assign reviewers while balancing load, respecting per-role limits, and prioritising chairs/preferred expertise."""
     if not members:
         raise ValueError("Cannot assign reviewers without PC members.")
     if reviewers_per_proposal < 2:
@@ -655,12 +673,13 @@ def assign_reviewers(
     if max_per_member is not None and max_per_member <= 0:
         raise ValueError("Maximum proposals per member must be positive.")
     if max_first_per_member is not None and max_first_per_member <= 0:
-        raise ValueError("Maximum first-reviewer assignments per member must be positive.")
+        raise ValueError("Maximum primary reviewer assignments per member must be positive.")
     if max_second_per_member is not None and max_second_per_member <= 0:
-        raise ValueError("Maximum second-reviewer assignments per member must be positive.")
+        raise ValueError("Maximum secondary reviewer assignments per member must be positive.")
     if reviewers_per_proposal > len(members):
         raise ValueError("Not enough PC members to satisfy reviewers-per-proposal.")
     chair_members = chair_members or set()
+    member_science_tags = member_science_tags or {}
     member_infos = [
         {
             "name": name,
@@ -669,6 +688,7 @@ def assign_reviewers(
             "first_count": 0,
             "second_count": 0,
             "is_chair": name in chair_members,
+            "science_tags": set(member_science_tags.get(name, set())),
             "order": idx,
         }
         for idx, name in enumerate(members)
@@ -694,42 +714,45 @@ def assign_reviewers(
                     continue
                 existing = fixed_first_map.get(code)
                 if existing and existing != member_name:
-                    raise ValueError(f"Conflicting first reviewer assignment for proposal {code}.")
+                    raise ValueError(f"Conflicting primary reviewer assignment for proposal {code}.")
                 fixed_first_map[code] = member_name
             for code in slots.get("second", []):
                 if not code:
                     continue
                 existing = fixed_second_map.get(code)
                 if existing and existing != member_name:
-                    raise ValueError(f"Conflicting second reviewer assignment for proposal {code}.")
+                    raise ValueError(f"Conflicting secondary reviewer assignment for proposal {code}.")
                 fixed_second_map[code] = member_name
 
+    PRIMARY_ROLE = "Primary Reviewer"
+    SECONDARY_ROLE = "Secondary Reviewer"
+
     def has_capacity(member: dict, role: str) -> bool:
-        if role == "First Reviewer" and max_first_per_member is not None:
+        if role == PRIMARY_ROLE and max_first_per_member is not None:
             if member["first_count"] >= max_first_per_member:
                 return False
-        if role == "Second Reviewer" and max_second_per_member is not None:
+        if role == SECONDARY_ROLE and max_second_per_member is not None:
             if member["second_count"] >= max_second_per_member:
                 return False
         return True
 
     def record_assignment(member: dict, role: str) -> None:
         member["count"] += 1
-        if role == "First Reviewer":
+        if role == PRIMARY_ROLE:
             member["first_count"] += 1
-        elif role == "Second Reviewer":
+        elif role == SECONDARY_ROLE:
             member["second_count"] += 1
 
     def priority_key(member: dict, role: str) -> Tuple[int, int, int, int]:
         """Return a tuple used to balance role-specific assignments (chairs soak up leftovers)."""
         chair_bias = 0 if member.get("is_chair") else 1
-        if role == "First Reviewer":
+        if role == PRIMARY_ROLE:
             return (member["first_count"], chair_bias, member["count"], member["order"])
-        if role == "Second Reviewer":
+        if role == SECONDARY_ROLE:
             return (member["second_count"], chair_bias, member["count"], member["order"])
         return (member["count"], chair_bias, member["order"], 0)
 
-    def select_member(excluded: Set[str], already_chosen: Set[str], role: str) -> dict:
+    def select_member(excluded: Set[str], already_chosen: Set[str], role: str, proposal_tags: Set[str]) -> dict:
         eligible = [
             member
             for member in member_infos
@@ -748,6 +771,12 @@ def assign_reviewers(
             ]
         if not eligible:
             raise ValueError("No available reviewers remaining for assignment within limits.")
+        if prefer_science_tags and role == PRIMARY_ROLE and proposal_tags:
+            preferred = [
+                member for member in eligible if member["science_tags"] and member["science_tags"].intersection(proposal_tags)
+            ]
+            if preferred:
+                eligible = preferred
         chosen = min(eligible, key=lambda m: priority_key(m, role))
         return chosen
 
@@ -776,9 +805,9 @@ def assign_reviewers(
             )
         role = role_labels[role_idx]
         if not has_capacity(member, role):
-            limit_label = "first" if role == "First Reviewer" else "second"
+            limit_label = "primary reviewer" if role == PRIMARY_ROLE else "secondary reviewer"
             raise ValueError(
-                f"Fixed reviewer '{member_name}' exceeds the maximum {limit_label}-reviewer assignments."
+                f"Fixed reviewer '{member_name}' exceeds the maximum {limit_label} assignments."
             )
         record_assignment(member, role)
         already_chosen.add(member["normalised"])
@@ -787,6 +816,7 @@ def assign_reviewers(
 
     for proposal in proposals:
         proposal_code = proposal["exp"]
+        proposal_tags: Set[str] = set(proposal.get("science_tags") or [])
         participants: Set[str] = set(proposal.get("participants", set()))
         excluded = set(participants)
         # Capture everyone we exclude so the CSV can describe conflicts explicitly.
@@ -823,10 +853,12 @@ def assign_reviewers(
         if fixed_second:
             if reviewers_per_proposal < 2:
                 raise ValueError(
-                    f"Cannot assign second reviewer for {proposal_code} when reviewers-per-proposal < 2."
+                    f"Cannot assign a secondary reviewer for {proposal_code} when reviewers-per-proposal < 2."
                 )
             if fixed_first and fixed_second == fixed_first:
-                raise ValueError(f"Member '{fixed_first}' cannot be both first and second reviewer for {proposal_code}.")
+                raise ValueError(
+                    f"Member '{fixed_first}' cannot be both primary and secondary reviewer for {proposal_code}."
+                )
             fixed_slots[1] = fixed_second
 
         for idx in range(reviewers_per_proposal):
@@ -835,7 +867,7 @@ def assign_reviewers(
             if fixed_member:
                 apply_fixed_member(fixed_member, idx, proposal_code, excluded, chosen, reviewers)
                 continue
-            member = select_member(excluded, chosen, role)
+            member = select_member(excluded, chosen, role, proposal_tags)
             chosen.add(member["normalised"])
             record_assignment(member, role)
             reviewers.append((role, member["name"]))
@@ -900,22 +932,31 @@ def write_science_tags(proposals: Sequence[Dict[str, Any]], destination: Path) -
     destination.write_text(content, encoding="utf-8")
 
 
-def build_reviewer_email_table(assignments: Dict[str, List[Tuple[str, str]]], roles: Sequence[str]) -> str:
+def build_reviewer_email_table(
+    assignments: Dict[str, List[Tuple[str, str]]],
+    roles: Sequence[str],
+    member_tags: Optional[Dict[str, Set[str]]] = None,
+) -> str:
     """Return an HTML table summarizing per-reviewer assignments by role."""
     if not assignments:
         return ""
 
-    base_roles: List[str] = []
+    base_role_display = {
+        "Primary Reviewer": "Primary",
+        "Secondary Reviewer": "Secondary",
+    }
+    base_roles: List[Tuple[str, str]] = []
     extra_roles: List[str] = []
     for role in roles:
-        if role.lower().startswith("additional reviewer"):
+        lower = role.lower()
+        if lower.startswith("additional review"):
             extra_roles.append(role)
-        else:
-            base_roles.append(role)
+        elif role in base_role_display:
+            base_roles.append((role, base_role_display[role]))
 
-    headers = ["Reviewer", *base_roles]
+    headers = ["Reviewer", *[display for _, display in base_roles]]
     if extra_roles:
-        headers.append("Additional Reviewers")
+        headers.append("Additional")
 
     lines = [
         '<table border="1" cellpadding="4" cellspacing="0" style="border-collapse:collapse;">',
@@ -932,7 +973,7 @@ def build_reviewer_email_table(assignments: Dict[str, List[Tuple[str, str]]], ro
         slot_map: Dict[str, List[str]] = defaultdict(list)
         for proposal_code, role in assignments[reviewer]:
             slot_map[role].append(proposal_code)
-        for role in base_roles:
+        for role, _display in base_roles:
             entries = slot_map.get(role)
             row_cells.append(format_assignment_entries(entries))
         if extra_roles:
@@ -955,9 +996,14 @@ def format_assignment_entries(entries: Optional[Sequence[str]]) -> str:
     return ", ".join(html.escape(entry) for entry in entries)
 
 
-def write_member_summary(assignments: Dict[str, List[Tuple[str, str]]], destination: Path, roles: Sequence[str]) -> None:
+def write_member_summary(
+    assignments: Dict[str, List[Tuple[str, str]]],
+    destination: Path,
+    roles: Sequence[str],
+    member_tags: Optional[Dict[str, Set[str]]] = None,
+) -> None:
     """Persist per-member assignments as an HTML table for easy emailing."""
-    table_html = build_reviewer_email_table(assignments, roles)
+    table_html = build_reviewer_email_table(assignments, roles, member_tags)
     if not table_html:
         table_html = "<p>No reviewer assignments available.</p>"
 
@@ -1105,13 +1151,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--max-first-per-member",
         type=int,
         metavar="COUNT",
-        help="Maximum number of first reviewer assignments per PC member.",
+        help="Maximum number of primary reviewer assignments per PC member.",
     )
     parser.add_argument(
         "--max-second-per-member",
         type=int,
         metavar="COUNT",
-        help="Maximum number of second reviewer assignments per PC member.",
+        help="Maximum number of secondary reviewer assignments per PC member.",
     )
     parser.add_argument(
         "--member-summary",
@@ -1127,6 +1173,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--science-tags-file",
         type=Path,
         help="Write inferred science categories per proposal to this file.",
+    )
+    parser.add_argument(
+        "--prefer-matching-tags",
+        action="store_true",
+        help="Prefer matching primary reviewers whose expertise tags overlap the proposal science tags.",
     )
     args = parser.parse_args(argv)
 
@@ -1147,6 +1198,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         or args.max_first_per_member
         or args.max_second_per_member
         or args.conflicts_file
+        or args.prefer_matching_tags
     ) and not args.pc_members:
         print("Reviewer-related options require --pc-members to be specified.", file=sys.stderr)
         return 1
@@ -1168,6 +1220,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     member_assignments: Optional[Dict[str, List[Tuple[str, str]]]] = None
     role_labels: Optional[List[str]] = None
     manual_conflicts: Dict[str, Set[str]] = {}
+    member_tags: Dict[str, Set[str]] = {}
 
     if args.conflicts_file:
         try:
@@ -1178,7 +1231,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.pc_members:
         try:
-            members, fixed_preferences, _member_emails, chair_members = load_pc_members(args.pc_members)
+            members, fixed_preferences, _member_emails, chair_members, member_tags = load_pc_members(args.pc_members)
         except (FileNotFoundError, ValueError) as exc:
             print(exc, file=sys.stderr)
             return 1
@@ -1186,7 +1239,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         member_count = len(members)
         if args.max_first_per_member is not None and member_count * args.max_first_per_member < proposal_count:
             print(
-                f"Insufficient first-reviewer capacity: need {proposal_count} slots for {proposal_count} proposals, "
+                f"Insufficient primary-reviewer capacity: need {proposal_count} slots for {proposal_count} proposals, "
                 f"but --max-first-per-member={args.max_first_per_member} with {member_count} members allows only "
                 f"{member_count * args.max_first_per_member}. Increase the limit or add more members.",
                 file=sys.stderr,
@@ -1194,7 +1247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         if args.max_second_per_member is not None and member_count * args.max_second_per_member < proposal_count:
             print(
-                f"Insufficient second-reviewer capacity: need {proposal_count} slots for {proposal_count} proposals, "
+                f"Insufficient secondary-reviewer capacity: need {proposal_count} slots for {proposal_count} proposals, "
                 f"but --max-second-per-member={args.max_second_per_member} with {member_count} members allows only "
                 f"{member_count * args.max_second_per_member}. Increase the limit or add more members.",
                 file=sys.stderr,
@@ -1223,6 +1276,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 args.max_second_per_member,
                 chair_members,
                 manual_conflicts or None,
+                args.prefer_matching_tags,
+                member_tags,
             )
         except ValueError as exc:
             print(exc, file=sys.stderr)
@@ -1236,7 +1291,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         if args.member_summary and member_assignments is not None:
             try:
-                write_member_summary(member_assignments, args.member_summary, role_labels or [])
+                write_member_summary(member_assignments, args.member_summary, role_labels or [], member_tags)
             except OSError as exc:
                 print(f"Failed to write member summary: {exc}", file=sys.stderr)
                 return 1
