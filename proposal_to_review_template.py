@@ -705,6 +705,7 @@ def assign_reviewers(
 
     fixed_first_map: Dict[str, str] = {}
     fixed_second_map: Dict[str, str] = {}
+    fixed_assignments: Set[Tuple[str, str]] = set()
     if fixed_preferences:
         for member_name, slots in fixed_preferences.items():
             if member_name not in members_by_name:
@@ -742,6 +743,13 @@ def assign_reviewers(
             member["first_count"] += 1
         elif role == SECONDARY_ROLE:
             member["second_count"] += 1
+
+    def remove_assignment(member: dict, role: str) -> None:
+        member["count"] = max(0, member["count"] - 1)
+        if role == PRIMARY_ROLE:
+            member["first_count"] = max(0, member["first_count"] - 1)
+        elif role == SECONDARY_ROLE:
+            member["second_count"] = max(0, member["second_count"] - 1)
 
     def priority_key(member: dict, role: str) -> Tuple[int, int, int, int]:
         """Return a tuple used to balance role-specific assignments (chairs soak up leftovers)."""
@@ -813,6 +821,7 @@ def assign_reviewers(
         already_chosen.add(member["normalised"])
         reviewers.append((role, member_name))
         per_member[member_name].append((proposal_code, role))
+        fixed_assignments.add((proposal_code, role))
 
     for proposal in proposals:
         proposal_code = proposal["exp"]
@@ -877,6 +886,96 @@ def assign_reviewers(
         proposal["first_reviewer"] = reviewers[0][1]
         proposal["second_reviewer"] = reviewers[1][1]
         proposal["conflicts"] = sorted(conflicts)
+
+    proposal_lookup: Dict[str, Dict[str, Any]] = {proposal["exp"]: proposal for proposal in proposals}
+
+    def rebalance_role_assignments(role_label: str) -> None:
+        """Reassign slots so starred chairs absorb leftover load for the given role."""
+        if not chair_members:
+            return
+        if role_label == PRIMARY_ROLE:
+            count_key = "first_count"
+        elif role_label == SECONDARY_ROLE:
+            count_key = "second_count"
+        else:
+            return
+
+        chair_infos = [members_by_name[name] for name in chair_members if name in members_by_name]
+        if not chair_infos:
+            return
+
+        blocked_donors: Set[str] = set()
+
+        def find_transfer_slot(donor_info: dict, chair_info: dict) -> Optional[Tuple[Dict[str, Any], int]]:
+            donor_name = donor_info["name"]
+            chair_name = chair_info["name"]
+            chair_norm = chair_info["normalised"]
+            assignments = per_member.get(donor_name, [])
+            for idx, (proposal_code, role) in enumerate(assignments):
+                if role != role_label:
+                    continue
+                if (proposal_code, role_label) in fixed_assignments:
+                    continue
+                proposal = proposal_lookup.get(proposal_code)
+                if not proposal:
+                    continue
+                if any(name == chair_name for _role, name in proposal.get("reviewers", [])):
+                    continue
+                excluded_norms: Set[str] = set(proposal.get("participants", set()))
+                for entry in proposal.get("conflicts") or []:
+                    norm = normalise_name(entry)
+                    if norm:
+                        excluded_norms.add(norm)
+                if chair_norm in excluded_norms:
+                    continue
+                return proposal, idx
+            return None
+
+        while True:
+            donor_pool = [
+                info
+                for info in member_infos
+                if info["name"] not in chair_members
+                and info[count_key] > 0
+                and info["name"] not in blocked_donors
+            ]
+            if not donor_pool:
+                break
+            donor_pool.sort(key=lambda info: (-info[count_key], info["order"]))
+            chair_pool = [
+                info
+                for info in chair_infos
+                if (max_per_member is None or info["count"] < max_per_member) and has_capacity(info, role_label)
+            ]
+            if not chair_pool:
+                break
+            chair_candidate = min(chair_pool, key=lambda info: (info[count_key], info["order"]))
+            donor = donor_pool[0]
+            if donor[count_key] <= chair_candidate[count_key]:
+                break
+
+            slot = find_transfer_slot(donor, chair_candidate)
+            if not slot:
+                blocked_donors.add(donor["name"])
+                continue
+            proposal, donor_idx = slot
+            proposal_code = proposal["exp"]
+
+            for idx, (role, name) in enumerate(proposal["reviewers"]):
+                if role == role_label and name == donor["name"]:
+                    proposal["reviewers"][idx] = (role_label, chair_candidate["name"])
+                    break
+
+            donor_assignments = per_member.get(donor["name"], [])
+            if donor_idx < len(donor_assignments):
+                donor_assignments.pop(donor_idx)
+            per_member[chair_candidate["name"]].append((proposal_code, role_label))
+
+            remove_assignment(donor, role_label)
+            record_assignment(chair_candidate, role_label)
+
+    rebalance_role_assignments(PRIMARY_ROLE)
+    rebalance_role_assignments(SECONDARY_ROLE)
 
     return per_member
 
@@ -1030,7 +1129,9 @@ def format_assignment_entries(entries: Optional[Sequence[str]]) -> str:
     """Format assignment codes for a table cell."""
     if not entries:
         return ""
-    return ", ".join(html.escape(entry) for entry in entries)
+    # Sort proposal codes alphabetically within each role column for readability.
+    sorted_entries = sorted(entries, key=str.lower)
+    return ", ".join(html.escape(entry) for entry in sorted_entries)
 
 
 def write_member_summary(
