@@ -56,10 +56,16 @@ from collections import defaultdict
 from template import render_record
 
 DocxRecord = Dict[str, Any]
+VERBOSE = False
 
 # Match experiment identifiers and waveband tokens in the PDF text.
 PROPOSAL_CODE_RE = re.compile(r"\b[EG]\d{2}[A-Z]\d{3}\b")
 WAVEBAND_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(cm|mm|m|GHz|MHz)", re.IGNORECASE)
+
+
+def log_verbose(message: str) -> None:
+    if VERBOSE:
+        print(f"[INFO] {message}", file=sys.stderr)
 
 
 def generate_role_labels(count: int) -> List[str]:
@@ -1270,7 +1276,9 @@ def build_comment_text(
 
 def write_docx_records(records: Sequence[DocxRecord], destination: Path) -> None:
     if not records:
+        log_verbose("No DOCX records to write; skipping file creation.")
         return
+    log_verbose(f"Preparing DOCX document with {len(records)} section(s).")
     document_xml, comments_xml = build_document_xml(records)
     include_comments = comments_xml is not None
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1564,6 +1572,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Write the meeting agenda DOCX to this file.",
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print progress information to stderr.",
+    )
+    parser.add_argument(
         "-m",
         "--pc-members",
         type=Path,
@@ -1629,6 +1643,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Prefer matching primary reviewers whose expertise tags overlap the proposal science tags.",
     )
     args = parser.parse_args(argv)
+    global VERBOSE
+    VERBOSE = bool(args.verbose)
 
     try:
         pdf_paths = list(iter_pdf_paths(args.pdfs, args.pdf_dir))
@@ -1639,6 +1655,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not pdf_paths:
         print("No proposal PDFs found.", file=sys.stderr)
         return 1
+    log_verbose(f"Discovered {len(pdf_paths)} proposal PDF(s).")
 
     if (
         args.assignments
@@ -1663,6 +1680,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except PdfExtractError as exc:
             print(f"{path}: {exc}", file=sys.stderr)
             return 2
+        log_verbose(f"Parsed proposal {proposal['exp']} – PI {proposal['pi']}.")
         proposal["pdf_path"] = str(path)
         proposals.append(proposal)
 
@@ -1715,6 +1733,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
         try:
             role_labels = generate_role_labels(args.reviewers_per_proposal)
+            log_verbose(
+                f"Assigning reviewers for {proposal_count} proposals using {member_count} PC members."
+            )
             member_assignments = assign_reviewers(
                 proposals,
                 members,
@@ -1734,12 +1755,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         assignments_path = args.assignments or Path("reviewer_assignments.txt")
         try:
+            log_verbose(f"Writing reviewer assignments to {assignments_path}.")
             write_assignments(proposals, assignments_path, role_labels or [])
         except OSError as exc:
             print(f"Failed to write assignments: {exc}", file=sys.stderr)
             return 1
         if args.member_summary and member_assignments is not None:
             try:
+                log_verbose(f"Writing member summary to {args.member_summary}.")
                 write_member_summary(member_assignments, args.member_summary, role_labels or [], member_tags)
             except OSError as exc:
                 print(f"Failed to write member summary: {exc}", file=sys.stderr)
@@ -1780,8 +1803,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ),
                 }
             )
+            log_verbose(f"Prepared feedback template page for {proposal['exp']}.")
 
     if args.output:
+        log_verbose(f"Writing text output to {args.output}.")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         content = "\n".join(output_lines)
         if output_lines and not content.endswith("\n"):
@@ -1793,6 +1818,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if feedback_path:
         try:
+            log_verbose(f"Writing feedback DOCX to {feedback_path}.")
             write_docx_records(feedback_records, feedback_path)
         except OSError as exc:
             print(f"Failed to write feedback DOCX: {exc}", file=sys.stderr)
@@ -1800,6 +1826,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.agenda_docx:
         try:
+            log_verbose(f"Writing agenda DOCX to {args.agenda_docx}.")
             write_docx_records([{"lines": build_agenda_lines()}], args.agenda_docx)
         except OSError as exc:
             print(f"Failed to write agenda DOCX: {exc}", file=sys.stderr)
@@ -1807,6 +1834,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.science_tags_file:
         try:
+            log_verbose(f"Writing science tags to {args.science_tags_file}.")
             write_science_tags(proposals, args.science_tags_file)
         except OSError as exc:
             print(f"Failed to write science tags file: {exc}", file=sys.stderr)
