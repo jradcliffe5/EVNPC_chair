@@ -49,7 +49,7 @@ import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 from xml.sax.saxutils import escape
 from collections import defaultdict
 
@@ -1092,6 +1092,33 @@ DEFAULT_STYLES_XML = (
     '    <w:name w:val="Normal"/>\n'
     "    <w:qFormat/>\n"
     "  </w:style>\n"
+    '  <w:style w:type="paragraph" w:styleId="Title">\n'
+    '    <w:name w:val="Title"/>\n'
+    '    <w:basedOn w:val="Normal"/>\n'
+    "    <w:qFormat/>\n"
+    "    <w:rPr>\n"
+    "      <w:b/>\n"
+    '      <w:sz w:val="56"/>\n'
+    "    </w:rPr>\n"
+    "  </w:style>\n"
+    '  <w:style w:type="paragraph" w:styleId="Heading1">\n'
+    '    <w:name w:val="Heading 1"/>\n'
+    '    <w:basedOn w:val="Normal"/>\n'
+    "    <w:qFormat/>\n"
+    "    <w:rPr>\n"
+    "      <w:b/>\n"
+    '      <w:sz w:val="32"/>\n'
+    "    </w:rPr>\n"
+    "  </w:style>\n"
+    '  <w:style w:type="paragraph" w:styleId="Heading2">\n'
+    '    <w:name w:val="Heading 2"/>\n'
+    '    <w:basedOn w:val="Normal"/>\n'
+    "    <w:qFormat/>\n"
+    "    <w:rPr>\n"
+    "      <w:b/>\n"
+    '      <w:sz w:val="28"/>\n'
+    "    </w:rPr>\n"
+    "  </w:style>\n"
     "</w:styles>"
 )
 
@@ -1100,16 +1127,17 @@ def needs_space_preservation(text: str) -> bool:
     return bool(text) and (text.startswith(" ") or text.endswith(" ") or "  " in text)
 
 
-def paragraph_xml(text: str, comment_id: Optional[int]) -> str:
+def paragraph_xml(text: str, comment_id: Optional[int], style: Optional[str] = None) -> str:
     indent = "    "
     if not text:
         return f"{indent}<w:p/>"
     attr = ' xml:space="preserve"' if needs_space_preservation(text) else ""
+    ppr = f"<w:pPr><w:pStyle w:val=\"{style}\"/></w:pPr>" if style else ""
     text_xml = f"<w:r><w:t{attr}>{escape(text)}</w:t></w:r>"
     if comment_id is None:
-        return f"{indent}<w:p>{text_xml}</w:p>"
+        return f"{indent}<w:p>{ppr}{text_xml}</w:p>"
     return (
-        f'{indent}<w:p><w:commentRangeStart w:id="{comment_id}"/>{text_xml}'
+        f'{indent}<w:p>{ppr}<w:commentRangeStart w:id="{comment_id}"/>{text_xml}'
         f'<w:commentRangeEnd w:id="{comment_id}"/><w:r><w:commentReference w:id="{comment_id}"/></w:r></w:p>'
     )
 
@@ -1139,6 +1167,23 @@ def build_comments_xml(entries: Sequence[Tuple[int, str]]) -> str:
     return "\n".join(lines)
 
 
+DocxLine = Union[str, Tuple[str, Optional[str]], Dict[str, Any]]
+
+
+def extract_docx_line(entry: DocxLine) -> Tuple[str, Optional[str]]:
+    if isinstance(entry, dict):
+        text = str(entry.get("text", ""))
+        style = entry.get("style")
+        return text, style
+    if isinstance(entry, tuple):
+        if not entry:
+            return "", None
+        text = str(entry[0])
+        style = entry[1] if len(entry) > 1 else None
+        return text, style
+    return str(entry), None
+
+
 def build_document_xml(records: Sequence[DocxRecord]) -> Tuple[str, Optional[str]]:
     lines = [
         DOCX_XML_DECL,
@@ -1155,10 +1200,11 @@ def build_document_xml(records: Sequence[DocxRecord]) -> Tuple[str, Optional[str
             comment_id = next_comment_id
             comment_entries.append((comment_id, comment_text))
             next_comment_id += 1
-        record_lines = record.get("lines") or []
-        for line_idx, text in enumerate(record_lines):
+        record_lines: Sequence[DocxLine] = record.get("lines") or []
+        for line_idx, entry in enumerate(record_lines):
+            text, style = extract_docx_line(entry)
             target_comment_id = comment_id if line_idx == 0 else None
-            lines.append(paragraph_xml(text, target_comment_id))
+            lines.append(paragraph_xml(text, target_comment_id, style))
         if record_idx < len(records) - 1:
             lines.append('    <w:p><w:r><w:br w:type="page"/></w:r></w:p>')
 
@@ -1236,6 +1282,48 @@ def write_docx_records(records: Sequence[DocxRecord], destination: Path) -> None
         archive.writestr("word/document.xml", document_xml)
         if include_comments and comments_xml:
             archive.writestr("word/comments.xml", comments_xml)
+
+
+def build_agenda_lines() -> List[DocxLine]:
+    return [
+        {"text": "EVN PC meeting __________________ (____________________)", "style": "Title"},
+        {"text": "Agenda v1.0", "style": "Heading2"},
+        "",
+        "Meeting dates (edit as needed): ________________________________",
+        "Meeting location (city, country): ______________________________",
+        "",
+        "Join Zoom Meeting: ________________________________",
+        "",
+        "Start of meeting: ________________________________",
+        "",
+        {"text": "1. Welcome, approval of the agenda – JR – 5'", "style": "Heading1"},
+        "",
+        {"text": "2. Minutes of the last meeting, action items – 10'", "style": "Heading1"},
+        "",
+        {"text": "3. Updates – brief, roundtable – 20'", "style": "Heading1"},
+        {"text": "3.1 Station updates", "style": "Heading2"},
+        {"text": "3.2 Correlator updates – RMC, AL", "style": "Heading2"},
+        {"text": "3.3 Scheduler's report, EVN resources", "style": "Heading2"},
+        {"text": "3.4 Review of PC membership", "style": "Heading2"},
+        {"text": "3.5 EVN PC issues/decisions since the last meeting", "style": "Heading2"},
+        "(see list at the end of the Agenda)",
+        "",
+        {"text": "4. Proposals of the 2024C call", "style": "Heading1"},
+        "",
+        {"text": "5. Scheduler's summary – 10'", "style": "Heading1"},
+        "Review of decisions and impact on sessions.",
+        "Future prospects.",
+        "",
+        {"text": "6. AOB", "style": "Heading1"},
+        "",
+        "End at ________________________________",
+        "",
+        {"text": "EVN PC Chair decisions since the last meeting", "style": "Heading1"},
+        "______________________________________________",
+        "",
+        {"text": "Notes:", "style": "Heading2"},
+        "______________________________________________",
+    ]
 
 
 def build_role_ascii_table(proposals: Sequence[Dict[str, Any]], roles: Sequence[str]) -> str:
@@ -1470,6 +1558,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Write a DOCX reviewer feedback template to this file.",
     )
     parser.add_argument(
+        "-A",
+        "--agenda-docx",
+        type=Path,
+        help="Write the meeting agenda DOCX to this file.",
+    )
+    parser.add_argument(
         "-m",
         "--pc-members",
         type=Path,
@@ -1702,6 +1796,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             write_docx_records(feedback_records, feedback_path)
         except OSError as exc:
             print(f"Failed to write feedback DOCX: {exc}", file=sys.stderr)
+            return 1
+
+    if args.agenda_docx:
+        try:
+            write_docx_records([{"lines": build_agenda_lines()}], args.agenda_docx)
+        except OSError as exc:
+            print(f"Failed to write agenda DOCX: {exc}", file=sys.stderr)
             return 1
 
     if args.science_tags_file:
