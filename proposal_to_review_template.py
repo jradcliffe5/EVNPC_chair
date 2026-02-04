@@ -56,7 +56,7 @@ from collections import defaultdict
 from template import render_record
 
 DocxRecord = Dict[str, Any]
-VERBOSE = False
+VERBOSE = True
 
 # Match experiment identifiers and waveband tokens in the PDF text.
 PROPOSAL_CODE_RE = re.compile(r"\b[EG]\d{2}[A-Z]\d{3}\b")
@@ -1572,10 +1572,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Write the meeting agenda DOCX to this file.",
     )
     parser.add_argument(
-        "-v",
-        "--verbose",
+        "-q",
+        "--quiet",
         action="store_true",
-        help="Print progress information to stderr.",
+        help="Suppress progress information on stderr.",
     )
     parser.add_argument(
         "-m",
@@ -1644,7 +1644,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
     global VERBOSE
-    VERBOSE = bool(args.verbose)
+    VERBOSE = not bool(args.quiet)
 
     try:
         pdf_paths = list(iter_pdf_paths(args.pdfs, args.pdf_dir))
