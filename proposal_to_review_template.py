@@ -46,11 +46,16 @@ import html
 import re
 import subprocess
 import sys
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from xml.sax.saxutils import escape
 from collections import defaultdict
 
 from template import render_record
+
+DocxRecord = Dict[str, Any]
 
 # Match experiment identifiers and waveband tokens in the PDF text.
 PROPOSAL_CODE_RE = re.compile(r"\b[EG]\d{2}[A-Z]\d{3}\b")
@@ -883,16 +888,12 @@ def assign_reviewers(
             per_member[member["name"]].append((proposal_code, role))
 
         proposal["reviewers"] = reviewers
-        proposal["first_reviewer"] = reviewers[0][1]
-        proposal["second_reviewer"] = reviewers[1][1]
         proposal["conflicts"] = sorted(conflicts)
 
     proposal_lookup: Dict[str, Dict[str, Any]] = {proposal["exp"]: proposal for proposal in proposals}
 
     def rebalance_role_assignments(role_label: str) -> None:
-        """Reassign slots so starred chairs absorb leftover load for the given role."""
-        if not chair_members:
-            return
+        """Reassign slots so every member stays within one assignment of each other for the role."""
         if role_label == PRIMARY_ROLE:
             count_key = "first_count"
         elif role_label == SECONDARY_ROLE:
@@ -900,16 +901,19 @@ def assign_reviewers(
         else:
             return
 
-        chair_infos = [members_by_name[name] for name in chair_members if name in members_by_name]
-        if not chair_infos:
-            return
-
         blocked_donors: Set[str] = set()
 
-        def find_transfer_slot(donor_info: dict, chair_info: dict) -> Optional[Tuple[Dict[str, Any], int]]:
+        def can_receive(member: dict) -> bool:
+            if max_per_member is not None and member["count"] >= max_per_member:
+                return False
+            return has_capacity(member, role_label)
+
+        def find_transfer_slot(donor_info: dict, recipient_info: dict) -> Optional[Tuple[Dict[str, Any], int]]:
+            if not can_receive(recipient_info):
+                return None
             donor_name = donor_info["name"]
-            chair_name = chair_info["name"]
-            chair_norm = chair_info["normalised"]
+            recipient_name = recipient_info["name"]
+            recipient_norm = recipient_info.get("normalised")
             assignments = per_member.get(donor_name, [])
             for idx, (proposal_code, role) in enumerate(assignments):
                 if role != role_label:
@@ -919,63 +923,94 @@ def assign_reviewers(
                 proposal = proposal_lookup.get(proposal_code)
                 if not proposal:
                     continue
-                if any(name == chair_name for _role, name in proposal.get("reviewers", [])):
+                if any(name == recipient_name for _role, name in proposal.get("reviewers", [])):
                     continue
                 excluded_norms: Set[str] = set(proposal.get("participants", set()))
                 for entry in proposal.get("conflicts") or []:
                     norm = normalise_name(entry)
                     if norm:
                         excluded_norms.add(norm)
-                if chair_norm in excluded_norms:
+                if recipient_norm and recipient_norm in excluded_norms:
                     continue
                 return proposal, idx
             return None
 
         while True:
-            donor_pool = [
+            if not member_infos:
+                break
+            counts = [member[count_key] for member in member_infos]
+            max_count = max(counts)
+            min_count = min(counts)
+            if max_count - min_count <= 1:
+                break
+
+            donors = [
                 info
                 for info in member_infos
-                if info["name"] not in chair_members
-                and info[count_key] > 0
-                and info["name"] not in blocked_donors
+                if info[count_key] == max_count and info["name"] not in blocked_donors
             ]
-            if not donor_pool:
-                break
-            donor_pool.sort(key=lambda info: (-info[count_key], info["order"]))
-            chair_pool = [
+            recipients = [
                 info
-                for info in chair_infos
-                if (max_per_member is None or info["count"] < max_per_member) and has_capacity(info, role_label)
+                for info in member_infos
+                if info[count_key] == min_count and can_receive(info)
             ]
-            if not chair_pool:
-                break
-            chair_candidate = min(chair_pool, key=lambda info: (info[count_key], info["order"]))
-            donor = donor_pool[0]
-            if donor[count_key] <= chair_candidate[count_key]:
+            if not donors or not recipients:
                 break
 
-            slot = find_transfer_slot(donor, chair_candidate)
-            if not slot:
-                blocked_donors.add(donor["name"])
-                continue
-            proposal, donor_idx = slot
-            proposal_code = proposal["exp"]
+            donors.sort(key=lambda info: (-info[count_key], info["order"]))
+            recipients.sort(key=lambda info: (info[count_key], info["order"]))
+            transfer_made = False
 
-            for idx, (role, name) in enumerate(proposal["reviewers"]):
-                if role == role_label and name == donor["name"]:
-                    proposal["reviewers"][idx] = (role_label, chair_candidate["name"])
+            for donor in donors:
+                for recipient in recipients:
+                    if donor["name"] == recipient["name"]:
+                        continue
+                    slot = find_transfer_slot(donor, recipient)
+                    if not slot:
+                        continue
+                    proposal, donor_idx = slot
+                    proposal_code = proposal["exp"]
+
+                    for idx, (role, name) in enumerate(proposal["reviewers"]):
+                        if role == role_label and name == donor["name"]:
+                            proposal["reviewers"][idx] = (role_label, recipient["name"])
+                            break
+
+                    donor_assignments = per_member.get(donor["name"], [])
+                    if donor_idx < len(donor_assignments):
+                        donor_assignments.pop(donor_idx)
+                    per_member[recipient["name"]].append((proposal_code, role_label))
+
+                    remove_assignment(donor, role_label)
+                    record_assignment(recipient, role_label)
+                    transfer_made = True
+                    blocked_donors.clear()
                     break
+                if transfer_made:
+                    break
+                blocked_donors.add(donor["name"])
 
-            donor_assignments = per_member.get(donor["name"], [])
-            if donor_idx < len(donor_assignments):
-                donor_assignments.pop(donor_idx)
-            per_member[chair_candidate["name"]].append((proposal_code, role_label))
-
-            remove_assignment(donor, role_label)
-            record_assignment(chair_candidate, role_label)
+            if not transfer_made:
+                break
 
     rebalance_role_assignments(PRIMARY_ROLE)
     rebalance_role_assignments(SECONDARY_ROLE)
+
+    for proposal in proposals:
+        reviewers = proposal.get("reviewers", [])
+        proposal["first_reviewer"] = next(
+            (name for role, name in reviewers if role == PRIMARY_ROLE),
+            None,
+        )
+        proposal["second_reviewer"] = next(
+            (name for role, name in reviewers if role == SECONDARY_ROLE),
+            None,
+        )
+        additional = [name for role, name in reviewers if role not in {PRIMARY_ROLE, SECONDARY_ROLE}]
+        if additional:
+            proposal["additional_reviewers"] = additional
+        else:
+            proposal.pop("additional_reviewers", None)
 
     return per_member
 
@@ -1033,6 +1068,174 @@ def write_science_tags(proposals: Sequence[Dict[str, Any]], destination: Path) -
         content += "\n"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(content, encoding="utf-8")
+
+
+DOCX_XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+WORDPROCESSING_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+DOCUMENT_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+CONTENT_TYPES_NS = "http://schemas.openxmlformats.org/package/2006/content-types"
+DOCX_COMMENT_AUTHOR = "EVN Programme Committee"
+DOCX_SEPARATOR = "=" * 69
+
+ROOT_RELATIONSHIPS_XML = (
+    f"{DOCX_XML_DECL}\n"
+    f'<Relationships xmlns="{PACKAGE_REL_NS}">\n'
+    f'  <Relationship Id="rId1" Type="{DOCUMENT_REL_NS}/officeDocument" Target="word/document.xml"/>\n'
+    "</Relationships>"
+)
+
+DEFAULT_STYLES_XML = (
+    f"{DOCX_XML_DECL}\n"
+    f'<w:styles xmlns:w="{WORDPROCESSING_NS}">\n'
+    '  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">\n'
+    '    <w:name w:val="Normal"/>\n'
+    "    <w:qFormat/>\n"
+    "  </w:style>\n"
+    "</w:styles>"
+)
+
+
+def needs_space_preservation(text: str) -> bool:
+    return bool(text) and (text.startswith(" ") or text.endswith(" ") or "  " in text)
+
+
+def paragraph_xml(text: str, comment_id: Optional[int]) -> str:
+    indent = "    "
+    if not text:
+        return f"{indent}<w:p/>"
+    attr = ' xml:space="preserve"' if needs_space_preservation(text) else ""
+    text_xml = f"<w:r><w:t{attr}>{escape(text)}</w:t></w:r>"
+    if comment_id is None:
+        return f"{indent}<w:p>{text_xml}</w:p>"
+    return (
+        f'{indent}<w:p><w:commentRangeStart w:id="{comment_id}"/>{text_xml}'
+        f'<w:commentRangeEnd w:id="{comment_id}"/><w:r><w:commentReference w:id="{comment_id}"/></w:r></w:p>'
+    )
+
+
+def comment_paragraph_xml(text: str) -> str:
+    if not text:
+        return "    <w:p/>"
+    attr = ' xml:space="preserve"' if needs_space_preservation(text) else ""
+    return f'    <w:p><w:r><w:t{attr}>{escape(text)}</w:t></w:r></w:p>'
+
+
+def build_comments_xml(entries: Sequence[Tuple[int, str]]) -> str:
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    lines = [
+        DOCX_XML_DECL,
+        f'<w:comments xmlns:w="{WORDPROCESSING_NS}">',
+    ]
+    for comment_id, text in entries:
+        lines.append(
+            f'  <w:comment w:id="{comment_id}" w:author="{DOCX_COMMENT_AUTHOR}" w:date="{timestamp}">'
+        )
+        comment_lines = text.splitlines() or [""]
+        for chunk in comment_lines:
+            lines.append(comment_paragraph_xml(chunk))
+        lines.append("  </w:comment>")
+    lines.append("</w:comments>")
+    return "\n".join(lines)
+
+
+def build_document_xml(records: Sequence[DocxRecord]) -> Tuple[str, Optional[str]]:
+    lines = [
+        DOCX_XML_DECL,
+        f'<w:document xmlns:w="{WORDPROCESSING_NS}">',
+        "  <w:body>",
+    ]
+    comment_entries: List[Tuple[int, str]] = []
+    next_comment_id = 0
+
+    for record_idx, record in enumerate(records):
+        comment_id: Optional[int] = None
+        comment_text = record.get("comment")
+        if comment_text:
+            comment_id = next_comment_id
+            comment_entries.append((comment_id, comment_text))
+            next_comment_id += 1
+        record_lines = record.get("lines") or []
+        for line_idx, text in enumerate(record_lines):
+            target_comment_id = comment_id if line_idx == 0 else None
+            lines.append(paragraph_xml(text, target_comment_id))
+        if record_idx < len(records) - 1:
+            lines.append('    <w:p><w:r><w:br w:type="page"/></w:r></w:p>')
+
+    lines.append("    <w:sectPr>")
+    lines.append('      <w:pgSz w:w="12240" w:h="15840"/>')
+    lines.append(
+        '      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" '
+        'w:header="708" w:footer="708" w:gutter="0"/>'
+    )
+    lines.append("    </w:sectPr>")
+    lines.append("  </w:body>")
+    lines.append("</w:document>")
+
+    document_xml = "\n".join(lines)
+    comments_xml = build_comments_xml(comment_entries) if comment_entries else None
+    return document_xml, comments_xml
+
+
+def build_document_relationships_xml(include_comments: bool) -> str:
+    lines = [
+        DOCX_XML_DECL,
+        f'<Relationships xmlns="{PACKAGE_REL_NS}">',
+        f'  <Relationship Id="rId1" Type="{DOCUMENT_REL_NS}/styles" Target="styles.xml"/>',
+    ]
+    if include_comments:
+        lines.append(
+            f'  <Relationship Id="rId2" Type="{DOCUMENT_REL_NS}/comments" Target="comments.xml"/>'
+        )
+    lines.append("</Relationships>")
+    return "\n".join(lines)
+
+
+def build_content_types_xml(include_comments: bool) -> str:
+    lines = [
+        DOCX_XML_DECL,
+        f'<Types xmlns="{CONTENT_TYPES_NS}">',
+        '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+        '  <Default Extension="xml" ContentType="application/xml"/>',
+        '  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
+        '  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>',
+    ]
+    if include_comments:
+        lines.append(
+            '  <Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/>'
+        )
+    lines.append("</Types>")
+    return "\n".join(lines)
+
+
+def build_comment_text(
+    first_reviewer: Optional[str],
+    second_reviewer: Optional[str],
+) -> Optional[str]:
+    entries: List[str] = []
+    if first_reviewer:
+        entries.append(f"Primary reviewer: {first_reviewer}")
+    if second_reviewer:
+        entries.append(f"Secondary reviewer: {second_reviewer}")
+    if not entries:
+        return None
+    return "\n".join(entries)
+
+
+def write_docx_records(records: Sequence[DocxRecord], destination: Path) -> None:
+    if not records:
+        return
+    document_xml, comments_xml = build_document_xml(records)
+    include_comments = comments_xml is not None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w") as archive:
+        archive.writestr("[Content_Types].xml", build_content_types_xml(include_comments))
+        archive.writestr("_rels/.rels", ROOT_RELATIONSHIPS_XML)
+        archive.writestr("word/_rels/document.xml.rels", build_document_relationships_xml(include_comments))
+        archive.writestr("word/styles.xml", DEFAULT_STYLES_XML)
+        archive.writestr("word/document.xml", document_xml)
+        if include_comments and comments_xml:
+            archive.writestr("word/comments.xml", comments_xml)
 
 
 def build_role_ascii_table(proposals: Sequence[Dict[str, Any]], roles: Sequence[str]) -> str:
@@ -1261,6 +1464,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Write the formatted output to this file instead of stdout.",
     )
     parser.add_argument(
+        "-f",
+        "--feedback",
+        type=Path,
+        help="Write a DOCX reviewer feedback template to this file.",
+    )
+    parser.add_argument(
         "-m",
         "--pc-members",
         type=Path,
@@ -1273,6 +1482,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="File to store reviewer assignments (defaults to reviewer_assignments.txt when --pc-members is used).",
     )
     parser.add_argument(
+        "-R",
         "--reviewers-per-proposal",
         type=int,
         default=2,
@@ -1280,39 +1490,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Total reviewers to assign per proposal (minimum 2, default 2).",
     )
     parser.add_argument(
+        "-M",
         "--max-per-member",
         type=int,
         metavar="MAX",
         help="Maximum number of proposals assigned to any single PC member.",
     )
     parser.add_argument(
+        "-F",
         "--max-first-per-member",
         type=int,
         metavar="COUNT",
         help="Maximum number of primary reviewer assignments per PC member.",
     )
     parser.add_argument(
+        "-S",
         "--max-second-per-member",
         type=int,
         metavar="COUNT",
         help="Maximum number of secondary reviewer assignments per PC member.",
     )
     parser.add_argument(
+        "-H",
         "--member-summary",
         type=Path,
         help="Write a per-member HTML assignment table to this file.",
     )
     parser.add_argument(
+        "-c",
         "--conflicts-file",
         type=Path,
         help="Optional file listing per-proposal conflicts (same format as the reviewer assignment appendix).",
     )
     parser.add_argument(
+        "-t",
         "--science-tags-file",
         type=Path,
         help="Write inferred science categories per proposal to this file.",
     )
     parser.add_argument(
+        "-T",
         "--prefer-matching-tags",
         action="store_true",
         help="Prefer matching primary reviewers whose expertise tags overlap the proposal science tags.",
@@ -1435,10 +1652,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
     output_lines: List[str] = []
+    feedback_records: List[DocxRecord] = []
+    feedback_path: Optional[Path] = args.feedback
 
     for proposal in proposals:
         proposal.pop("normalised_text", None)
         proposal.pop("participants", None)
+        additional_reviewers = proposal.get("additional_reviewers")
         rendered = list(
             render_record(
                 proposal["exp"],
@@ -1448,10 +1668,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 proposal["title"],
                 proposal.get("first_reviewer"),
                 proposal.get("second_reviewer"),
+                additional_reviewers,
             )
         )
         output_lines.extend(rendered)
         output_lines.append("")
+        if feedback_path:
+            docx_lines = list(rendered)
+            if docx_lines:
+                docx_lines[0] = DOCX_SEPARATOR
+            feedback_records.append(
+                {
+                    "lines": docx_lines,
+                    "comment": build_comment_text(
+                        proposal.get("first_reviewer"),
+                        proposal.get("second_reviewer"),
+                    ),
+                }
+            )
 
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1462,6 +1696,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         for line in output_lines:
             print(line)
+
+    if feedback_path:
+        try:
+            write_docx_records(feedback_records, feedback_path)
+        except OSError as exc:
+            print(f"Failed to write feedback DOCX: {exc}", file=sys.stderr)
+            return 1
 
     if args.science_tags_file:
         try:

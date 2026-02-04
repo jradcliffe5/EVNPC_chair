@@ -35,17 +35,11 @@ def render_record(
     yield LINE_TEMPLATE.format(exp=exp, pi=pi, nets=nets, lambda_=lambda_)
     yield f"{title:<{TITLE_WIDTH}}"
     yield ""
-    if first_reviewer or second_reviewer or additional_reviewers:
-        if first_reviewer:
-            yield f"First reviewer: {first_reviewer}"
-        if second_reviewer:
-            yield f"Second reviewer: {second_reviewer}"
-        if additional_reviewers:
-            for idx, reviewer in enumerate(additional_reviewers, start=1):
-                yield f"Additional reviewer {idx}: {reviewer}"
-        yield ""
     yield "Grade:"
+    yield ""
     yield "Referee comments:"
+    yield "Strengths:"
+    yield "Weaknesses:"
     yield ""
     yield "Technical review:"
     yield ""
