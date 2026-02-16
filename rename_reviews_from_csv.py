@@ -19,13 +19,21 @@ Example:
     python rename_reviews_from_csv.py pc_chair/EVN_PC_review_submission.csv \
         --prefix E25A001 --source-dir "Copy of EVN.../Review submission (File responses)" \
         --dest-dir pc_chair/reviews
+    python rename_reviews_from_csv.py "https://docs.google.com/spreadsheets/d/.../edit#gid=0" \
+        --prefix E25A001 --source-dir downloads --dest-dir pc_chair/reviews
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import io
+import re
+import shutil
 import sys
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from textwrap import dedent
 from typing import Iterable, Optional, Sequence, Tuple
@@ -47,8 +55,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "csv_path",
-        type=Path,
-        help="Path to the CSV export (e.g. EVN_PC_review_submission.csv).",
+        help="Path to the CSV export or a Google Sheets URL.",
     )
     parser.add_argument(
         "--prefix",
@@ -61,7 +68,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help=(
             "Directory containing the downloaded review files. "
-            "Defaults to the CSV's parent directory."
+            "Defaults to the CSV's parent directory (or the current working directory for URLs)."
         ),
     )
     parser.add_argument(
@@ -80,6 +87,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Silently continue when a referenced file cannot be located.",
     )
+    parser.add_argument(
+        "--no-docx-conversion",
+        action="store_true",
+        help="Disable automatic conversion of .docx submissions to .txt.",
+    )
     return parser.parse_args(argv)
 
 
@@ -95,6 +107,50 @@ def sanitized_component(value: str) -> str:
 def normalize_name(value: str) -> str:
     """Normalise a name for comparison (case-insensitive, single spaces)."""
     return " ".join(value.lower().split())
+
+
+def is_url(value: str) -> bool:
+    return value.startswith(("http://", "https://"))
+
+
+def gsheet_csv_url(url: str) -> str:
+    """Return a CSV export URL for a Google Sheets share link."""
+    if "format=csv" in url or "output=csv" in url:
+        return url
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    if not match:
+        return url
+    sheet_id = match.group(1)
+    gid_match = re.search(r"[?&]gid=([0-9]+)", url)
+    gid = gid_match.group(1) if gid_match else None
+    export = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    if gid:
+        export = f"{export}&gid={gid}"
+    return export
+
+
+@contextmanager
+def open_csv_source(csv_path: str) -> Iterable[Tuple[Iterable[str], str, Optional[Path]]]:
+    """Yield a file-like object, label, and optional parent directory."""
+    if is_url(csv_path):
+        csv_url = gsheet_csv_url(csv_path)
+        try:
+            with urllib.request.urlopen(csv_url) as response:
+                data = response.read()
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Unable to download CSV from {csv_url}: {exc}") from exc
+        text = data.decode("utf-8-sig", errors="replace")
+        handle = io.StringIO(text)
+        try:
+            yield handle, csv_url, None
+        finally:
+            handle.close()
+    else:
+        path = Path(csv_path)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        with path.open(newline="", encoding="utf-8") as handle:
+            yield handle, str(path), path.parent
 
 
 def find_submission_file(
@@ -132,60 +188,128 @@ def unique_destination(path: Path) -> Path:
 
 def build_new_name(prefix: str, name: str, surname: str, suffix: str) -> str:
     """Construct the new filename from the prefix and reviewer name."""
+    return build_base_name(prefix, name, surname) + suffix
+
+
+def build_base_name(prefix: str, name: str, surname: str) -> str:
+    """Construct the base filename without a file extension."""
     components = [prefix]
     for value in (name, surname):
         components.append(sanitized_component(value))
-    return "_".join(components) + suffix
+    return "_".join(components)
+
+
+def unique_stem(dest_dir: Path, stem: str, suffixes: Sequence[str]) -> str:
+    """Return a unique stem such that all suffix variations are free."""
+    counter = 0
+    while True:
+        candidate = stem if counter == 0 else f"{stem}_{counter}"
+        if all(not (dest_dir / f"{candidate}{suffix}").exists() for suffix in suffixes):
+            return candidate
+        counter += 1
+
+
+def extract_docx_text(path: Path) -> str:
+    """Extract text from a docx file using python-docx."""
+    try:
+        import docx  # type: ignore
+    except ImportError as exc:  # pragma: no cover - depends on optional dependency
+        raise RuntimeError(
+            "python-docx is required for .docx conversion. Install with: pip install python-docx"
+        ) from exc
+
+    document = docx.Document(str(path))
+    lines: list[str] = []
+    for paragraph in document.paragraphs:
+        if paragraph.text:
+            lines.append(paragraph.text)
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                cell_text = cell.text.strip()
+                if cell_text:
+                    lines.append(cell_text)
+    return "\n".join(lines)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    csv_path: Path = args.csv_path
-    if not csv_path.is_file():
-        print(f"CSV not found: {csv_path}", file=sys.stderr)
-        return 1
+    convert_docx = not args.no_docx_conversion
 
-    source_dir: Path = args.source_dir or csv_path.parent
+    source_dir: Optional[Path] = args.source_dir
     dest_dir: Path = args.dest_dir
     dry_run: bool = args.dry_run
 
-    if not source_dir.exists():
-        print(f"Source directory not found: {source_dir}", file=sys.stderr)
+    csv_parent: Optional[Path] = None
+    try:
+        with open_csv_source(args.csv_path) as (handle, _csv_label, csv_parent):
+            if source_dir is None:
+                source_dir = csv_parent or Path.cwd()
+
+            if not source_dir.exists():
+                print(f"Source directory not found: {source_dir}", file=sys.stderr)
+                return 1
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            missing: list[Tuple[str, str, str]] = []
+            processed = 0
+
+            reader = csv.DictReader(handle)
+            for row in reader:
+                name = row.get("Name", "").strip()
+                surname = row.get("Surname", "").strip()
+
+                if not name and not surname:
+                    if not args.skip_missing:
+                        missing.append(("", "", "Missing Name and Surname in CSV row."))
+                    continue
+
+                located = find_submission_file(name, surname, source_dir)
+                if located is None:
+                    if not args.skip_missing:
+                        missing.append((name, surname, "Matching file not found."))
+                    continue
+
+                suffix = located.suffix or ".txt"
+                if suffix.lower() == ".docx" and convert_docx:
+                    base = build_base_name(args.prefix, name, surname)
+                    stem = unique_stem(dest_dir, base, [".txt", suffix])
+                    txt_destination = dest_dir / f"{stem}.txt"
+                    docx_destination = dest_dir / f"{stem}{suffix}"
+
+                    if dry_run:
+                        print(f"[DRY-RUN] {located} -> {txt_destination} (converted)")
+                        print(f"[DRY-RUN] {located} -> {docx_destination}")
+                    else:
+                        try:
+                            content = extract_docx_text(located)
+                        except RuntimeError as exc:
+                            if not args.skip_missing:
+                                missing.append((name, surname, str(exc)))
+                            continue
+                        txt_destination.parent.mkdir(parents=True, exist_ok=True)
+                        txt_destination.write_text(content, encoding="utf-8")
+                        shutil.copy2(located, docx_destination)
+                        print(f"Converted: {located} -> {txt_destination}")
+                        print(f"Copied: {located} -> {docx_destination}")
+                else:
+                    new_name = build_new_name(args.prefix, name, surname, suffix)
+                    destination = unique_destination(dest_dir / new_name)
+
+                    if dry_run:
+                        print(f"[DRY-RUN] {located} -> {destination}")
+                    else:
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(located, destination)
+                        print(f"Copied: {located} -> {destination}")
+                processed += 1
+    except FileNotFoundError:
+        print(f"CSV not found: {args.csv_path}", file=sys.stderr)
         return 1
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    missing: list[Tuple[str, str, str]] = []
-    processed = 0
-
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            name = row.get("Name", "").strip()
-            surname = row.get("Surname", "").strip()
-
-            if not name and not surname:
-                if not args.skip_missing:
-                    missing.append(("", "", "Missing Name and Surname in CSV row."))
-                continue
-
-            located = find_submission_file(name, surname, source_dir)
-            if located is None:
-                if not args.skip_missing:
-                    missing.append((name, surname, "Matching file not found."))
-                continue
-
-            suffix = located.suffix or ".txt"
-            new_name = build_new_name(args.prefix, name, surname, suffix)
-            destination = unique_destination(dest_dir / new_name)
-
-            if dry_run:
-                print(f"[DRY-RUN] {located} -> {destination}")
-            else:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                located.replace(destination)
-                print(f"Moved: {located} -> {destination}")
-            processed += 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     if missing:
         print("\nUnable to process:", file=sys.stderr)

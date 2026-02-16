@@ -25,6 +25,7 @@ from proposal_to_review_template import load_pc_members
 
 NAME_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 PROPOSAL_RE = re.compile(r"[A-Z]\d{2}[A-Z]\d{3}", re.IGNORECASE)
+SECTION_LABELS = ("Grade:", "Referee comments:", "Technical review:", "Time recommended:")
 
 
 @dataclass
@@ -39,6 +40,13 @@ class Reminder:
     reviewer: str
     email: Optional[str]
     proposals: List[Tuple[str, str]]
+
+
+@dataclass
+class ReviewFile:
+    path: Path
+    tokens: List[str]
+    proposals: Dict[str, bool]
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -202,6 +210,10 @@ DUE_DATE_DISPLAY_NAMES = {
 
 def due_date_for_role(role: str, due_dates: Mapping[str, datetime]) -> datetime:
     tokens = set(tokenise(role))
+    if "primary" in tokens:
+        return due_dates["first"]
+    if "secondary" in tokens:
+        return due_dates["second"]
     if "first" in tokens:
         return due_dates["first"]
     if "second" in tokens:
@@ -241,6 +253,8 @@ def load_assignments(path: Path) -> List[Assignment]:
             proposal = row[0].strip()
             if not proposal:
                 continue
+            if not PROPOSAL_RE.fullmatch(proposal):
+                continue
             for idx, role in enumerate(roles, start=1):
                 if idx >= len(row):
                     break
@@ -250,54 +264,102 @@ def load_assignments(path: Path) -> List[Assignment]:
     return assignments
 
 
-def collect_review_file_signatures(reviews_dir: Path) -> List[Tuple[Path, List[str]]]:
+def parse_review_text(text: str) -> Dict[str, bool]:
+    proposals: Dict[str, bool] = {}
+    current_proposal: Optional[str] = None
+    current_lines: List[str] = []
+
+    def finalize_block(proposal: Optional[str], lines: List[str]) -> None:
+        if not proposal:
+            return
+        sections: Dict[str, List[str]] = {label: [] for label in SECTION_LABELS}
+        current_label: Optional[str] = None
+        for line in lines:
+            stripped = line.strip()
+            if re.fullmatch(r"=+", stripped):
+                continue
+            matched_label = None
+            for label in SECTION_LABELS:
+                if stripped.startswith(label):
+                    matched_label = label
+                    remainder = stripped[len(label) :].strip()
+                    if remainder:
+                        sections[label].append(remainder)
+                    current_label = label
+                    break
+            if matched_label:
+                continue
+            if current_label:
+                sections[current_label].append(line)
+        filled = any("".join(lines).strip() for lines in sections.values())
+        proposals[proposal] = filled
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current_proposal is not None:
+                current_lines.append(line)
+            continue
+        if re.fullmatch(r"=+", stripped):
+            continue
+        match = PROPOSAL_RE.match(stripped)
+        if match:
+            finalize_block(current_proposal, current_lines)
+            current_proposal = match.group(0).upper()
+            current_lines = [line]
+            continue
+        if current_proposal is not None:
+            current_lines.append(line)
+
+    finalize_block(current_proposal, current_lines)
+    return proposals
+
+
+def collect_review_files(reviews_dir: Path) -> List[ReviewFile]:
     if not reviews_dir.exists():
         return []
-    signatures: List[Tuple[Path, List[str]]] = []
+    signatures: List[ReviewFile] = []
     for path in sorted(reviews_dir.rglob("*")):
         if not path.is_file():
             continue
         tokens = tokenise(path.stem.replace("-", " "))
         if not tokens:
             continue
-        signatures.append((path, tokens))
+        proposals: Dict[str, bool] = {}
+        if path.suffix.lower() == ".txt":
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            proposals = parse_review_text(content)
+        signatures.append(ReviewFile(path=path, tokens=tokens, proposals=proposals))
     return signatures
 
 
-def find_review(
+def review_is_submitted(
     proposal: str,
     reviewer: str,
-    files: Iterable[Tuple[Path, List[str]]],
-) -> Optional[Path]:
-    proposal_token = canonical_name(proposal)
+    files: Iterable[ReviewFile],
+) -> bool:
+    proposal_key = proposal.upper()
     reviewer_tokens = tokenise(reviewer)
-    if not proposal_token or not reviewer_tokens:
-        return None
+    if not proposal_key or not reviewer_tokens:
+        return False
 
-    proposal_tokens = set(tokenise(proposal_token))
     reviewer_token_set = set(reviewer_tokens)
-
-    for path, tokens in files:
-        token_set = set(tokens)
-        if proposal_tokens - token_set:
+    for review_file in files:
+        token_set = set(review_file.tokens)
+        if not reviewer_token_set.issubset(token_set):
             continue
-        if reviewer_token_set.issubset(token_set):
-            return path
-
-        # Fallback: attempt to extract reviewer name from remainder of filename.
-        stem = path.stem
-        match = PROPOSAL_RE.search(stem)
-        if match:
-            remainder = (stem[: match.start()] + " " + stem[match.end() :]).strip()
-            remainder_tokens = set(tokenise(remainder))
-            if reviewer_token_set.issubset(remainder_tokens):
-                return path
-    return None
+        status = review_file.proposals.get(proposal_key)
+        if status is True:
+            return True
+    return False
 
 
 def build_reminders(
     assignments: Sequence[Assignment],
-    files: Iterable[Tuple[Path, List[str]]],
+    files: Iterable[ReviewFile],
     contacts: Mapping[str, str],
     due_dates: Mapping[str, datetime],
     current_date: datetime,
@@ -309,8 +371,7 @@ def build_reminders(
         if current_date < role_due_date:
             continue
 
-        found = find_review(assignment.proposal, assignment.reviewer, file_cache)
-        if found:
+        if review_is_submitted(assignment.proposal, assignment.reviewer, file_cache):
             continue
 
         reviewer_key = canonical_name(assignment.reviewer)
@@ -510,7 +571,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     contacts: Dict[str, str] = {canonical_name(name): email for name, email in member_emails.items()}
 
-    file_signatures = collect_review_file_signatures(args.reviews_dir)
+    file_signatures = collect_review_files(args.reviews_dir)
     reminders = build_reminders(assignments, file_signatures, contacts, due_dates, current_date)
 
     print_summary(reminders, current_date)
