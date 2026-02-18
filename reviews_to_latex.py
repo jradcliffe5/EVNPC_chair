@@ -15,6 +15,7 @@ import csv
 import io
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from textwrap import dedent
@@ -27,6 +28,17 @@ FIELD_NAMES = [
     "Technical review",
     "Time recommended",
 ]
+SIMPLE_FIELD_NAMES = [
+    "Grade",
+    "General remark",
+    "Strengths",
+    "Weaknesses",
+    "Referee comments",
+    "Technical review",
+    "Time recommended",
+]
+PROPOSAL_CODE_RE = re.compile(r"^[A-Z]\d{2}[A-Z]\d{3}$", re.IGNORECASE)
+SPECIAL_GRADE_RE = re.compile(r"\b(resubmission|reject)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -97,6 +109,64 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+UNICODE_REPLACEMENTS = {
+    " ": " ",
+    "‐": "-",
+    "‑": "-",
+    "‒": "-",
+    "–": "--",
+    "—": "---",
+    "−": "-",
+    "…": "...",
+    "‘": "'",
+    "’": "'",
+    "“": "``",
+    "”": "''",
+    "µ": r"$\mu$",
+    "°": r"$^{\circ}$",
+    "×": r"$\times$",
+    "≤": r"$\le$",
+    "≥": r"$\ge$",
+    "α": r"$\alpha$",
+    "β": r"$\beta$",
+    "γ": r"$\gamma$",
+    "π": r"$\pi$",
+    "μ": r"$\mu$",
+}
+
+
+def normalize_unicode(text: str) -> str:
+    """Normalize common Unicode punctuation/symbols to LaTeX-safe ASCII."""
+    if not text:
+        return text
+    for source, replacement in UNICODE_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
+    cleaned = []
+    for char in text:
+        if ord(char) < 128:
+            cleaned.append(char)
+            continue
+        decomposed = unicodedata.normalize("NFKD", char)
+        ascii_part = decomposed.encode("ascii", "ignore").decode("ascii")
+        cleaned.append(ascii_part if ascii_part else "?")
+    return "".join(cleaned)
+
+
+def normalize_paragraphs(text: str) -> str:
+    """Collapse line breaks inside paragraphs; keep blank-line paragraph breaks."""
+    if not text:
+        return text
+    paragraphs = re.split(r"\n\s*\n", text)
+    cleaned_paragraphs = []
+    for para in paragraphs:
+        # Join any wrapped lines within the paragraph.
+        pieces = [line.strip() for line in para.splitlines() if line.strip()]
+        if not pieces:
+            continue
+        cleaned_paragraphs.append(" ".join(pieces))
+    return "\n\n".join(cleaned_paragraphs)
+
+
 def latex_escape(text: str) -> str:
     """Escape LaTeX special characters in the supplied text."""
     replacements = {
@@ -112,8 +182,8 @@ def latex_escape(text: str) -> str:
         "^": r"\textasciicircum{}",
     }
     pattern = re.compile("|".join(re.escape(key) for key in replacements))
-    return pattern.sub(lambda match: replacements[match.group()], text)
-
+    escaped = pattern.sub(lambda match: replacements[match.group()], text)
+    return normalize_unicode(escaped)
 
 def reviewer_initials(name: str) -> str:
     """Return uppercase initials derived from the reviewer name."""
@@ -124,6 +194,8 @@ def reviewer_initials(name: str) -> str:
 
 def parse_numeric_grade(value: str) -> Optional[float]:
     """Extract the first numeric token from the grade string."""
+    if SPECIAL_GRADE_RE.search(value or ""):
+        return 4.0
     match = re.search(r"-?\d+(?:\.\d+)?", value)
     if not match:
         return None
@@ -151,10 +223,19 @@ def normalise_reviewer_from_filename(path: Path) -> str:
 def role_superscript(role: Optional[int]) -> str:
     """Return latex superscript for reviewer role."""
     if role == 1:
-        return r"\textsuperscript{*1}"
+        return r"\textsuperscript{1}"
     if role == 2:
-        return r"\textsuperscript{*2}"
+        return r"\textsuperscript{2}"
     return ""
+
+
+def role_sort_key(role: Optional[int]) -> int:
+    """Sort order: primary (1), secondary (2), then unassigned."""
+    if role == 1:
+        return 0
+    if role == 2:
+        return 1
+    return 2
 
 
 def load_assignments(path: Path) -> Dict[str, Dict[str, int]]:
@@ -177,8 +258,12 @@ def load_assignments(path: Path) -> Dict[str, Dict[str, int]]:
             if not code:
                 continue
             code_map = mapping.setdefault(code, {})
-            first = row_lower.get("first reviewer", "")
-            second = row_lower.get("second reviewer", "")
+            first = row_lower.get("first reviewer", "") or row_lower.get(
+                "primary reviewer", ""
+            )
+            second = row_lower.get("second reviewer", "") or row_lower.get(
+                "secondary reviewer", ""
+            )
             if first:
                 code_map[normalise_person_name(first)] = 1
             if second:
@@ -213,30 +298,127 @@ def load_assignments(path: Path) -> Dict[str, Dict[str, int]]:
     return mapping
 
 
-def parse_value_block(lines: List[str], start_index: int) -> tuple[str, str, int]:
+def parse_value_block(
+    lines: List[str],
+    start_index: int,
+    field_names: Sequence[str] = FIELD_NAMES,
+) -> tuple[str, str, int]:
     """Return (label, value, next_index) for the block starting at start_index."""
     raw_line = lines[start_index]
     label, value = raw_line.split(":", 1)
     label = label.strip()
-    value_lines: List[str] = [value.strip()]
+    paragraphs: List[str] = []
+    current: List[str] = []
+    first_value = value.strip()
+    if first_value:
+        current.append(first_value)
     index = start_index + 1
     while index < len(lines):
         candidate = lines[index]
         stripped = candidate.strip()
-        if not stripped:
+        if any(stripped.startswith(f"{name}:") for name in field_names):
+            break
+        if stripped == "":
+            if current:
+                paragraphs.append(" ".join(current).strip())
+                current = []
             index += 1
-            break
-        if any(stripped.startswith(f"{name}:") for name in FIELD_NAMES):
-            break
-        value_lines.append(stripped)
+            continue
+        current.append(stripped)
         index += 1
-    cleaned_value = "\n".join(line for line in value_lines if line).strip()
+    if current:
+        paragraphs.append(" ".join(current).strip())
+    cleaned_value = "\n\n".join(paragraphs).strip()
     return label, cleaned_value, index
+
+
+def parse_simple_review_content(content: str, path: Path) -> Dict[str, ProposalSummary]:
+    """Parse compact review files that list proposal codes and short fields."""
+    lines = [line.rstrip() for line in content.splitlines()]
+    code_indices = [
+        idx for idx, line in enumerate(lines) if PROPOSAL_CODE_RE.match(line.strip())
+    ]
+    if not code_indices:
+        return {}
+
+    summaries: Dict[str, ProposalSummary] = {}
+    reviewer_name = normalise_reviewer_from_filename(path)
+
+    for pos, start_index in enumerate(code_indices):
+        end_index = code_indices[pos + 1] if pos + 1 < len(code_indices) else len(lines)
+        code = lines[start_index].strip()
+        block_lines = lines[start_index + 1 : end_index]
+
+        field_values = {name: "" for name in SIMPLE_FIELD_NAMES}
+        index = 0
+        while index < len(block_lines):
+            current = block_lines[index]
+            stripped = current.strip()
+            if not stripped:
+                index += 1
+                continue
+            if ":" not in stripped:
+                index += 1
+                continue
+
+            label = stripped.split(":", 1)[0].strip()
+            if label not in SIMPLE_FIELD_NAMES:
+                index += 1
+                continue
+
+            label, value, index = parse_value_block(
+                block_lines, index, field_names=SIMPLE_FIELD_NAMES
+            )
+            field_values[label] = value
+
+        if not any(field_values[name] for name in SIMPLE_FIELD_NAMES):
+            continue
+
+        summary = summaries.setdefault(
+            code,
+            ProposalSummary(
+                code=code,
+                title="",
+                pi="",
+                networks="",
+                wavelengths="",
+                reviews=[],
+            ),
+        )
+
+        referee_comments = field_values["Referee comments"].strip()
+        extra_sections: List[str] = []
+        for label in ("General remark", "Strengths", "Weaknesses"):
+            value = field_values.get(label, "").strip()
+            if value:
+                extra_sections.append(f"{label}: {value}")
+        if extra_sections:
+            if referee_comments:
+                referee_comments = "\n\n".join([referee_comments] + extra_sections)
+            else:
+                referee_comments = "\n\n".join(extra_sections)
+
+        review_entry = ReviewEntry(
+            reviewer=reviewer_name,
+            source_file=path,
+            grade=field_values["Grade"],
+            referee_comments=referee_comments,
+            technical_review=field_values["Technical review"],
+            time_recommended=field_values["Time recommended"],
+        )
+        summary.reviews.append(review_entry)
+
+    return summaries
 
 
 def parse_review_file(path: Path) -> Dict[str, ProposalSummary]:
     """Parse a single review file into proposal summaries keyed by proposal code."""
     content = path.read_text(encoding="utf-8")
+    if SEPARATOR not in content:
+        simple_summaries = parse_simple_review_content(content, path)
+        if simple_summaries:
+            return simple_summaries
+
     blocks = [block.strip("\n") for block in content.split(SEPARATOR) if block.strip()]
     summaries: Dict[str, ProposalSummary] = {}
 
@@ -354,21 +536,19 @@ def format_review_block(review: ReviewEntry) -> str:
         )
 
     if review.referee_comments:
-        parts.append("\\textbf{Referee comments}")
-        comments = latex_escape(review.referee_comments).replace("\n", "\\\\\n")
-        parts.append("\\begin{quote}")
+        parts.append("\\textbf{Referee comments}\\\\")
+        comments = latex_escape(normalize_paragraphs(review.referee_comments))
         parts.append(comments)
-        parts.append("\\end{quote}")
 
     if review.technical_review:
-        parts.append("\\textbf{Technical review}")
-        tech = latex_escape(review.technical_review).replace("\n", "\\\\\n")
-        parts.append("\\begin{quote}")
+        parts.append("\\par")
+        parts.append("\\textbf{Technical review}\\\\")
+        tech = latex_escape(normalize_paragraphs(review.technical_review))
         parts.append(tech)
-        parts.append("\\end{quote}")
 
     source_path = latex_escape(str(review.source_file))
-    parts.append(f"\\textit{{Source file:}} {source_path}")
+    parts.append("\\par")
+    parts.append(f"\\textit{{Source file:}} {source_path}\\\\")
     return "\n".join(parts)
 
 
@@ -386,6 +566,8 @@ def build_latex_document(
         r"\usepackage{titling}",
         r"\setlength{\droptitle}{-1.5em}",
         r"\renewcommand{\familydefault}{\sfdefault}",
+        r"\setlength{\parindent}{0pt}",
+        r"\setlength{\parskip}{5pt}",
         r"\setlist{nosep}",
         r"\begin{document}",
         rf"\title{{{latex_escape(title)}}}",
@@ -413,13 +595,16 @@ def build_latex_document(
             if review.grade.strip()
         ]
         if grade_entries:
-            sorted_entries = sorted(grade_entries, key=lambda item: item[0])
+            sorted_entries = sorted(
+                grade_entries, key=lambda item: (role_sort_key(item[2]), item[0])
+            )
             header_cells: List[str] = []
             values: List[str] = []
             numeric_values: List[float] = []
             for initials, grade, role in sorted_entries:
                 header_cells.append(f"{latex_escape(initials)}{role_superscript(role)}")
-                values.append(grade)
+                display_grade = "4.0" if SPECIAL_GRADE_RE.search(grade or "") else grade
+                values.append(display_grade)
                 numeric = parse_numeric_grade(grade)
                 if numeric is not None:
                     numeric_values.append(numeric)
@@ -478,8 +663,11 @@ def build_latex_document(
             body.append("\\textit{No reviews available.}")
             continue
 
-        # Sort reviews by reviewer name for deterministic output.
-        for review in sorted(summary.reviews, key=lambda r: r.reviewer.lower()):
+        # Sort reviews: primary, secondary, then the rest (by name).
+        for review in sorted(
+            summary.reviews,
+            key=lambda r: (role_sort_key(r.role), r.reviewer.lower()),
+        ):
             body.append(format_review_block(review))
             body.append("")  # Blank line between reviews
 
