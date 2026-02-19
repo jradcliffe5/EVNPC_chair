@@ -92,6 +92,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Disable automatic conversion of .docx submissions to .txt.",
     )
+    parser.add_argument(
+        "--prefer-newest",
+        action="store_true",
+        help=(
+            "When multiple submissions match a reviewer, choose the most recently "
+            "modified file."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -107,6 +115,16 @@ def sanitized_component(value: str) -> str:
 def normalize_name(value: str) -> str:
     """Normalise a name for comparison (case-insensitive, single spaces)."""
     return " ".join(value.lower().split())
+
+
+def split_version_suffix(stem: str) -> Tuple[str, Optional[int]]:
+    """Split common duplicate suffixes like ' (1)' or '_1' from a filename stem."""
+    match = re.search(r"(?:\s*\((\d+)\)|_(\d+))$", stem)
+    if not match:
+        return stem, None
+    version = int(match.group(1) or match.group(2))
+    base = stem[: match.start()].rstrip()
+    return base, version
 
 
 def is_url(value: str) -> bool:
@@ -157,19 +175,31 @@ def find_submission_file(
     name: str,
     surname: str,
     source_dir: Path,
+    prefer_newest: bool = False,
 ) -> Optional[Path]:
     """Locate a file matching '* - Name Surname.*' in the source directory."""
     target_tail = normalize_name(f"- {name} {surname}")
-    # Search in deterministic order to make behaviour predictable.
+    matches: list[Tuple[Path, Optional[int]]] = []
     for candidate in sorted(source_dir.rglob("*")):
         if not candidate.is_file():
             continue
-        stem = candidate.stem
+        stem, version = split_version_suffix(candidate.stem)
         # Preserve the part before the extension; multi-dot names are fine.
         stem_normalized = normalize_name(stem.replace("_", " "))
         if stem_normalized.endswith(target_tail):
-            return candidate
-    return None
+            if not prefer_newest:
+                return candidate
+            matches.append((candidate, version))
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda item: (
+            0 if item[1] is None else item[1],
+            item[0].stat().st_mtime,
+            str(item[0]).lower(),
+        ),
+    )[0]
 
 
 def unique_destination(path: Path) -> Path:
@@ -254,6 +284,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             missing: list[Tuple[str, str, str]] = []
             processed = 0
+            processed_reviewers: set[str] = set()
 
             reader = csv.DictReader(handle)
             for row in reader:
@@ -265,7 +296,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         missing.append(("", "", "Missing Name and Surname in CSV row."))
                     continue
 
-                located = find_submission_file(name, surname, source_dir)
+                reviewer_key = normalize_name(f"{name} {surname}")
+                if args.prefer_newest and reviewer_key in processed_reviewers:
+                    continue
+
+                located = find_submission_file(
+                    name,
+                    surname,
+                    source_dir,
+                    prefer_newest=args.prefer_newest,
+                )
                 if located is None:
                     if not args.skip_missing:
                         missing.append((name, surname, "Matching file not found."))
@@ -274,9 +314,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 suffix = located.suffix or ".txt"
                 if suffix.lower() == ".docx" and convert_docx:
                     base = build_base_name(args.prefix, name, surname)
-                    stem = unique_stem(dest_dir, base, [".txt", suffix])
-                    txt_destination = dest_dir / f"{stem}.txt"
-                    docx_destination = dest_dir / f"{stem}{suffix}"
+                    if args.prefer_newest:
+                        txt_destination = dest_dir / f"{base}.txt"
+                        docx_destination = dest_dir / f"{base}{suffix}"
+                    else:
+                        stem = unique_stem(dest_dir, base, [".txt", suffix])
+                        txt_destination = dest_dir / f"{stem}.txt"
+                        docx_destination = dest_dir / f"{stem}{suffix}"
 
                     if dry_run:
                         print(f"[DRY-RUN] {located} -> {txt_destination} (converted)")
@@ -295,7 +339,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         print(f"Copied: {located} -> {docx_destination}")
                 else:
                     new_name = build_new_name(args.prefix, name, surname, suffix)
-                    destination = unique_destination(dest_dir / new_name)
+                    destination = (
+                        dest_dir / new_name
+                        if args.prefer_newest
+                        else unique_destination(dest_dir / new_name)
+                    )
 
                     if dry_run:
                         print(f"[DRY-RUN] {located} -> {destination}")
@@ -304,6 +352,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         shutil.copy2(located, destination)
                         print(f"Copied: {located} -> {destination}")
                 processed += 1
+                if args.prefer_newest:
+                    processed_reviewers.add(reviewer_key)
     except FileNotFoundError:
         print(f"CSV not found: {args.csv_path}", file=sys.stderr)
         return 1

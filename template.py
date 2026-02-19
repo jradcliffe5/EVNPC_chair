@@ -34,7 +34,17 @@ def render_record(
     yield SEPARATOR
     yield LINE_TEMPLATE.format(exp=exp, pi=pi, nets=nets, lambda_=lambda_)
     yield f"{title:<{TITLE_WIDTH}}"
-    yield ""
+    reviewer_lines: List[str] = []
+    if first_reviewer:
+        reviewer_lines.append(f"Primary reviewer: {first_reviewer}")
+    if second_reviewer:
+        reviewer_lines.append(f"Secondary reviewer: {second_reviewer}")
+    if reviewer_lines:
+        yield ""
+        yield from reviewer_lines
+        yield ""
+    else:
+        yield ""
     yield "Grade:"
     yield ""
     yield "Referee comments:"

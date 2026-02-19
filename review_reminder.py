@@ -25,6 +25,10 @@ from proposal_to_review_template import load_pc_members
 
 NAME_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 PROPOSAL_RE = re.compile(r"[A-Z]\d{2}[A-Z]\d{3}", re.IGNORECASE)
+PROPOSAL_HEADER_RE = re.compile(
+    r"^(?P<code>[A-Z]\d{2}[A-Z]\d{3})(?:\s{2,}|\s*$)",
+    re.IGNORECASE,
+)
 SECTION_LABELS = ("Grade:", "Referee comments:", "Technical review:", "Time recommended:")
 
 
@@ -294,6 +298,7 @@ def parse_review_text(text: str) -> Dict[str, bool]:
         filled = any("".join(lines).strip() for lines in sections.values())
         proposals[proposal] = filled
 
+    last_was_separator = False
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -301,15 +306,25 @@ def parse_review_text(text: str) -> Dict[str, bool]:
                 current_lines.append(line)
             continue
         if re.fullmatch(r"=+", stripped):
+            last_was_separator = True
             continue
-        match = PROPOSAL_RE.match(stripped)
-        if match:
+        proposal_code = None
+        header_match = PROPOSAL_HEADER_RE.match(line.lstrip())
+        if header_match:
+            proposal_code = header_match.group("code")
+        elif last_was_separator:
+            loose_match = PROPOSAL_RE.match(stripped)
+            if loose_match:
+                proposal_code = loose_match.group(0)
+        if proposal_code:
             finalize_block(current_proposal, current_lines)
-            current_proposal = match.group(0).upper()
+            current_proposal = proposal_code.upper()
             current_lines = [line]
+            last_was_separator = False
             continue
         if current_proposal is not None:
             current_lines.append(line)
+        last_was_separator = False
 
     finalize_block(current_proposal, current_lines)
     return proposals
