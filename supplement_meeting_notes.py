@@ -113,13 +113,13 @@ def call_claude(notes_text, supplementary_sources):
     sources_block = ""
     for label, content in supplementary_sources.items():
         if content:
-            truncated = content[:40000] if len(content) > 40000 else content
+            truncated = content[:800000] if len(content) > 800000 else content
             sources_block += f"\n\n=== {label.upper()} ===\n{truncated}"
 
     prompt = f"""{SYSTEM_PROMPT}
 
 MEETING NOTES:
-{notes_text[:20000]}
+{notes_text[:100000]}
 
 SUPPLEMENTARY SOURCES:{sources_block}
 
