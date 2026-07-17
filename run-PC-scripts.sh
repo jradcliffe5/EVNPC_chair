@@ -144,12 +144,23 @@ case "$SECTION" in
   feedback)
     case "$CMD" in
       send)
+        read -rp "CC address(es) for feedback emails (comma/space separated, blank for none): " CC_INPUT
+        CC_ARGS=()
+        if [ -n "$CC_INPUT" ]; then
+          IFS=', ' read -ra CC_LIST <<< "$CC_INPUT"
+          for addr in "${CC_LIST[@]}"; do
+            if [ -n "$addr" ]; then
+              CC_ARGS+=(--cc "$addr")
+            fi
+          done
+        fi
         $PY_EXEC ${SCRIPTS_DIR}/send_feedback_emails.py \
           --feedback-docx "EVNPC_${SESSION}_feedback.docx" \
           --pi-emails-file "EVNPC_${SESSION}_pi_emails.txt" \
           --pdf-dir feedback_tex/ \
           --code-mapping evn_code_mapping.txt \
-          --smtp-username $GMAIL_ADDRESS --smtp-password $GMAIL_APP_PWD $FEEDBACK_SEND_MODE
+          --smtp-username $GMAIL_ADDRESS --smtp-password $GMAIL_APP_PWD \
+          "${CC_ARGS[@]}" $FEEDBACK_SEND_MODE
         ;;
       reminder)
         $PY_EXEC ${SCRIPTS_DIR}/review_reminder.py \
