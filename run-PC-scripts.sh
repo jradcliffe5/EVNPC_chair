@@ -18,9 +18,15 @@ usage() {
   echo "  feedback  --tex-only     -- generate per-proposal .tex files only (no .docx written)"
   echo "  feedback  reminder [--send]  -- send reminders to PC members with missing feedback summaries"
   echo "  feedback  send    [--draft|--send]  -- feedback emails to PIs: dry-run (default), save as Gmail draft, or send"
+  echo "  feedback  archive [--send]   -- copy the outcome emails already sent to PIs to the PC chair list (dry-run by default)"
 }
 
 SESSION="2026A"
+
+# Archive destination for outcome emails already delivered to PIs, and the
+# gap between successive messages so the list is not flooded.
+ARCHIVE_ADDRESS="evn-pc-chair@jiscmail.ac.uk"
+ARCHIVE_DELAY_SECONDS=300
 
 SCRIPTS_DIR="../../pc_chair/EVNPC_chair_scripts"                                                                                                                                                                                                                
 SHEETS_URL=$EVNPC_SHEETS
@@ -161,6 +167,32 @@ case "$SECTION" in
           --code-mapping evn_code_mapping.txt \
           --smtp-username $GMAIL_ADDRESS --smtp-password $GMAIL_APP_PWD \
           "${CC_ARGS[@]}" $FEEDBACK_SEND_MODE
+        ;;
+      archive)
+        # Re-send each outcome email that already reached its PI to the PC
+        # chair list so the decisions are archived there.  Reads the PI sent
+        # log so nothing undelivered is archived, and keeps its own log so
+        # re-runs don't duplicate.
+        if [ "$FLAG" = "--send" ]; then
+          echo "This will send one email per already-sent outcome to ${ARCHIVE_ADDRESS},"
+          echo "spaced ${ARCHIVE_DELAY_SECONDS}s apart (~$((ARCHIVE_DELAY_SECONDS / 60)) min each), so the run will take hours."
+          echo "Leave this shell running until it finishes."
+          read -rp "Type 'yes' to confirm: " CONFIRM
+          if [ "$CONFIRM" != "yes" ]; then
+            echo "Aborted."; exit 1
+          fi
+        fi
+        $PY_EXEC ${SCRIPTS_DIR}/send_feedback_emails.py \
+          --feedback-docx "EVNPC_${SESSION}_feedback.docx" \
+          --pi-emails-file "EVNPC_${SESSION}_pi_emails.txt" \
+          --pdf-dir feedback_tex/ \
+          --code-mapping evn_code_mapping.txt \
+          --to-override "$ARCHIVE_ADDRESS" \
+          --require-sent-log "EVNPC_${SESSION}_feedback_sent.json" \
+          --sent-log "EVNPC_${SESSION}_feedback_archived.json" \
+          --delay "$ARCHIVE_DELAY_SECONDS" \
+          --smtp-username $GMAIL_ADDRESS --smtp-password $GMAIL_APP_PWD \
+          $FEEDBACK_SEND_MODE
         ;;
       reminder)
         $PY_EXEC ${SCRIPTS_DIR}/review_reminder.py \

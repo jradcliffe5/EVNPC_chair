@@ -147,6 +147,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Send emails even for proposals already recorded in the sent log.",
     )
     parser.add_argument(
+        "--require-sent-log",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "Only process proposals recorded with status 'sent' in this log. "
+            "Used by the archive step so only outcomes that actually reached a "
+            "PI are copied to the archive address."
+        ),
+    )
+    parser.add_argument(
+        "--to-override",
+        metavar="ADDRESS",
+        default=None,
+        help=(
+            "Send every message to this address instead of the PI.  The PI's "
+            "address is still resolved and recorded in an X-Original-Recipient "
+            "header.  Used to archive outcome emails to the PC chair list."
+        ),
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "Pause this many seconds between successive messages (default: 0). "
+            "Set to 300 when archiving to a mailing list so the list is not "
+            "flooded."
+        ),
+    )
+    parser.add_argument(
         "--subject-template",
         default=DEFAULT_SUBJECT,
         help=(
@@ -573,7 +605,12 @@ def build_message(
     msg["Subject"] = subject
     if sender:
         msg["From"] = sender
-    msg["To"] = to_email
+    if args.to_override:
+        msg["To"] = args.to_override
+        # Keep a record of who the outcome originally went to.
+        msg["X-Original-Recipient"] = to_email
+    else:
+        msg["To"] = to_email
     if args.reply_to:
         msg["Reply-To"] = args.reply_to
     if args.cc:
@@ -614,11 +651,15 @@ def send_proposal_email(
 
     pdf_display = str(pdf_path) if pdf_path else "none"
     cc_display = f"  CC={', '.join(args.cc)}" if args.cc else ""
+    # When archiving, show the archive address and the PI it originally went to.
+    dest_display = (
+        f"{args.to_override} (orig: {to_email})" if args.to_override else to_email
+    )
 
     # ---- Dry-run ----
     if not args.send and not args.draft:
         print(
-            f"[DRY-RUN] {code_label} → {to_email}{cc_display}\n"
+            f"[DRY-RUN] {code_label} → {dest_display}{cc_display}\n"
             f"  Subject: {subject}\n"
             f"  PDF: {pdf_display}\n"
             f"  Body preview ({len(proposal.body_text)} chars):\n"
@@ -643,7 +684,7 @@ def send_proposal_email(
     if args.draft:
         print(
             f"[DRAFT]   {code_label} → {args.drafts_folder} "
-            f"(To: {to_email}  PDF: {pdf_display})",
+            f"(To: {dest_display}  PDF: {pdf_display})",
             flush=True,
         )
         save_as_gmail_draft(args, msg)
@@ -655,11 +696,11 @@ def send_proposal_email(
     # ---- Send via SMTP ----
     server_display = f"{args.smtp_server}:{args.smtp_port}"
     print(
-        f"[SENDING] via {server_display}  {code_label} → {to_email}{cc_display}",
+        f"[SENDING] via {server_display}  {code_label} → {dest_display}{cc_display}",
         flush=True,
     )
     deliver_email(args, msg)
-    print(f"[SENT]    {code_label} ({to_email})", flush=True)
+    print(f"[SENT]    {code_label} ({dest_display})", flush=True)
 
     if args.export_emails:
         export_eml(msg, proposal, args.export_emails)
@@ -717,6 +758,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             + ", ".join(already)
         )
 
+    # Restrict to outcomes that actually reached a PI ----------------------
+    # (archive step: never copy something the PI never received).
+    delivered_codes: Optional[Set[str]] = None
+    if args.require_sent_log:
+        source_log = load_sent_log(args.require_sent_log)
+        delivered_codes = {
+            code for code, entry in source_log.items()
+            if entry.get("status") == "sent"
+        }
+        print(
+            f"[LOG] {len(delivered_codes)} proposal(s) marked 'sent' in "
+            f"{args.require_sent_log.name} — only these will be processed."
+        )
+        if not delivered_codes:
+            print(
+                "Nothing to do: no outcome emails have been sent to PIs yet "
+                f"(entries in {args.require_sent_log.name} with status 'sent')."
+            )
+            return 0
+
     # Filter to requested proposals if specified --------------------------
     filter_codes: Optional[Set[str]] = None
     if args.proposals:
@@ -726,8 +787,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     skipped_placeholders = 0
     skipped_no_email = 0
     skipped_already_sent = 0
+    skipped_not_delivered = 0
     sent = 0
     errors = 0
+    pending_delay = False  # stagger between messages, but not before the first
 
     for proposal in proposals:
         if filter_codes and proposal.code not in filter_codes:
@@ -737,6 +800,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{proposal.legacy_code}/{proposal.code}"
             if proposal.legacy_code else proposal.code
         )
+
+        if delivered_codes is not None and proposal.code not in delivered_codes:
+            print(
+                f"[SKIP] {code_label}: not recorded as sent to the PI in "
+                f"{args.require_sent_log.name}.",
+                flush=True,
+            )
+            skipped_not_delivered += 1
+            continue
 
         # Skip proposals already successfully sent (unless --force).
         # Draft mode does not count as "sent" — only --send does.
@@ -779,9 +851,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 flush=True,
             )
 
+        # Stagger real deliveries so a mailing list is not flooded.  Only
+        # between messages — no point waiting before the first or in dry-run.
+        if pending_delay and args.delay > 0 and (args.send or args.draft):
+            print(
+                f"[WAIT]    {args.delay:.0f}s before {code_label} ...",
+                flush=True,
+            )
+            time.sleep(args.delay)
+
         try:
             send_proposal_email(proposal, to_email, pdf_path, args)
             sent += 1
+            pending_delay = True
             # Record in the log only for real actions (not dry-run).
             if args.send:
                 record_sent(sent_log, sent_log_path, proposal.code, to_email, status="sent")
@@ -802,10 +884,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mode = "saved as draft"
     else:
         mode = "dry-run preview"
+    not_delivered_display = (
+        f"  |  skipped (not sent to PI): {skipped_not_delivered}"
+        if args.require_sent_log else ""
+    )
     print(
         f"Done. {mode}: {sent}  |  skipped (already sent): {skipped_already_sent}  "
         f"|  skipped (placeholders): {skipped_placeholders}  "
-        f"|  skipped (no email): {skipped_no_email}  |  errors: {errors}"
+        f"|  skipped (no email): {skipped_no_email}"
+        f"{not_delivered_display}  |  errors: {errors}"
     )
     if (args.send or args.draft) and sent_log:
         print(f"Sent log: {sent_log_path}")
