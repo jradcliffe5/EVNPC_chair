@@ -25,7 +25,7 @@ The shell script `run-PC-scripts.sh` is the primary interface for the full PC-ch
 | `GMAIL_ADDRESS` | Gmail address used as the SMTP sender for review reminders and feedback emails |
 | `GMAIL_APP_PWD` | Gmail App Password for SMTP/IMAP authentication |
 
-Edit the `SESSION` variable at the top of the script to match the current observing period (e.g. `2026A`). The script also assumes the scripts live in `SCRIPTS_DIR` and reviewer file uploads land in `REVIEWS_SOURCE_DIR` (both set near the top of `run-PC-scripts.sh`) and runs everything through the pinned `PY_EXEC` interpreter — adjust these paths for your machine.
+Edit the `SESSION` variable at the top of the script to match the current observing period (e.g. `2026A`). `ARCHIVE_ADDRESS` and `ARCHIVE_DELAY_SECONDS` (also near the top) control the `feedback archive` step — the mailing list that receives the archived outcome emails, and the gap between successive messages. The script also assumes the scripts live in `SCRIPTS_DIR` and reviewer file uploads land in `REVIEWS_SOURCE_DIR` (both set near the top of `run-PC-scripts.sh`) and runs everything through the pinned `PY_EXEC` interpreter — adjust these paths for your machine.
 
 ### Commands
 
@@ -48,7 +48,8 @@ Edit the `SESSION` variable at the top of the script to match the current observ
 | `feedback` | | Generate draft feedback `.docx`. Add `--split-tex` to also write per-proposal LaTeX files. |
 | `feedback` | `--tex-only` | Write per-proposal LaTeX files only — no `.docx` is produced. |
 | `feedback` | `reminder` | Preview reminder emails for PC members with missing feedback summaries (add `--send` to actually send). |
-| `feedback` | `send` | Preview feedback emails to PIs (dry-run). Add `--draft` to save as Gmail drafts, or `--send` to deliver. |
+| `feedback` | `send` | Preview feedback emails to PIs (dry-run). Add `--draft` to save as Gmail drafts, or `--send` to deliver. Prompts for optional CC addresses. |
+| `feedback` | `archive` | Copy the outcome emails already delivered to PIs to the PC chair list (dry-run by default; `--send` to deliver). |
 
 ## Typical workflow
 
@@ -249,6 +250,8 @@ Preview (dry-run, no emails sent):
 ./run-PC-scripts.sh feedback send
 ```
 
+All three modes below first prompt for optional CC addresses (comma- or space-separated; leave blank for none), which are passed through as `--cc`.
+
 Save as Gmail drafts (review in your Drafts folder before sending):
 ```bash
 ./run-PC-scripts.sh feedback send --draft
@@ -281,6 +284,40 @@ Key options:
 - `--cc ADDRESS` — add CC recipients (may be repeated)
 - `--reply-to ADDRESS` — set a Reply-To header
 - `--export-emails DIR` — save each email as a `.eml` file
+- `--delay SECONDS` — pause between successive messages (default: `0`); used by the archive step so a mailing list is not flooded
+- `--to-override ADDRESS` — send every message to this address instead of the PI. The PI's address is still resolved and recorded in an `X-Original-Recipient` header
+- `--require-sent-log FILE` — only process proposals recorded with status `sent` in this log, so nothing the PI never received is re-sent elsewhere
+
+### 5d. Archive outcome emails to the PC chair list
+
+Once the outcome emails have gone out to PIs, copy them to the PC chair mailing list so the decisions are archived there. This reads the PI sent log (`EVNPC_<session>_feedback_sent.json`) and only processes proposals actually delivered, keeping its own log (`EVNPC_<session>_feedback_archived.json`) so re-runs do not duplicate.
+
+Preview (dry-run):
+```bash
+./run-PC-scripts.sh feedback archive
+```
+
+Send:
+```bash
+./run-PC-scripts.sh feedback archive --send
+```
+
+Messages are spaced `ARCHIVE_DELAY_SECONDS` apart (default 300 s) to avoid flooding the list, so a full run takes several hours — leave the shell running until it finishes. The `--send` form asks for confirmation before starting.
+
+Or directly:
+```bash
+python send_feedback_emails.py \
+  --feedback-docx EVNPC_2026A_feedback.docx \
+  --pi-emails-file EVNPC_2026A_pi_emails.txt \
+  --pdf-dir feedback_tex/ \
+  --code-mapping evn_code_mapping.txt \
+  --to-override evn-pc-chair@jiscmail.ac.uk \
+  --require-sent-log EVNPC_2026A_feedback_sent.json \
+  --sent-log EVNPC_2026A_feedback_archived.json \
+  --delay 300 \
+  --smtp-username $GMAIL_ADDRESS --smtp-password $GMAIL_APP_PWD \
+  [--dry-run | --send]
+```
 
 ### 6. Supplement meeting notes
 
@@ -301,6 +338,26 @@ Key options:
 - `--no-ai` — skip Claude synthesis; just append full transcripts as a new section
 
 Audio transcripts are cached as `<audio>.transcript.txt` alongside the source file, so re-runs do not re-transcribe.
+
+## Utilities
+
+### `NRAO_to_EVN_grade.py`
+
+Converts an NRAO-style grade on the 0–10 scale (10 = highest priority) to the EVN 0.5–2.5 priority scale (0.5 = highest priority):
+
+```bash
+python NRAO_to_EVN_grade.py 8      # -> 0.90
+python NRAO_to_EVN_grade.py        # prompts for the grade
+```
+
+## Review file parsing
+
+The review parsers (`reviews_to_latex.py`, `review_reminder.py`) accept the variations that arrive in practice:
+
+- **Section headings** — `Grade`, `Referee comments`, `General remark(s)`, `Strengths`, `Weaknesses`, `Technical review`, and `Time recommended` are all recognised. `General remark`, `Strengths`, and `Weaknesses` are folded into the referee comments in the LaTeX output. Recognising the full set also means an untouched blank template (which still carries the heading lines) is correctly reported as an outstanding review rather than a submitted one.
+- **Separator width** — any line consisting solely of `=` characters (20 or more) separates proposals, so templates emitted with 80- or 100-column rules both parse.
+- **Combined proposal codes** — headers of the form `E26B001/EB120` are matched on the leading EVN code, so assignment and conflict lookups line up with `reviewer_assignments.txt`.
+- **Byte-order marks** — files saved by Word/Windows with a leading BOM are read as `utf-8-sig`, so the first proposal in the file is no longer dropped.
 
 ## Additional notes
 
